@@ -2161,10 +2161,14 @@ struct model_manager {
             bool is_terminal =
                 (status == MODEL_JOB_COMPLETED || status == MODEL_JOB_FAILED || status == MODEL_JOB_CANCELLED);
             if (is_terminal) {
-                auto age = std::chrono::duration_cast<std::chrono::minutes>(now - job->end_time);
-                if (age > max_age) {
-                    jobs_it = jobs.erase(jobs_it);
-                    continue;
+                // Check if end_time was set (it's set in set_status for terminal states)
+                // Use start_time as a proxy check - if start_time > end_time, end_time wasn't set
+                if (job->end_time > job->start_time) {
+                    auto age = std::chrono::duration_cast<std::chrono::minutes>(now - job->end_time);
+                    if (age > max_age) {
+                        jobs_it = jobs.erase(jobs_it);
+                        continue;
+                    }
                 }
             }
             ++jobs_it;
@@ -6362,7 +6366,14 @@ int main(int argc, char ** argv) {
 
     // Model management endpoint handlers
     const auto handle_models_load = [&ctx_server, &res_error](const httplib::Request & req, httplib::Response & res) {
-        json req_data = json::parse(req.body);
+        // Parse JSON with exception handling
+        json req_data;
+        try {
+            req_data = json::parse(req.body);
+        } catch (const std::exception & e) {
+            res_error(res, format_error_response(std::string("Invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
 
         // Extract model path and parameters
         std::string model_path = req_data.value("model", "");
@@ -6375,15 +6386,33 @@ int main(int argc, char ** argv) {
         common_params params = ctx_server.params_base;  // Start with base params
         params.model.path    = model_path;
 
-        // Optional parameters
+        // Optional parameters with validation
         if (req_data.contains("n_gpu_layers")) {
-            params.n_gpu_layers = req_data["n_gpu_layers"];
+            int n_gpu_layers = req_data["n_gpu_layers"];
+            if (n_gpu_layers < -1 || n_gpu_layers > 1000) {  // reasonable range
+                res_error(
+                    res, format_error_response("n_gpu_layers must be between -1 and 1000", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            params.n_gpu_layers = n_gpu_layers;
         }
         if (req_data.contains("n_ctx")) {
-            params.n_ctx = req_data["n_ctx"];
+            int n_ctx = req_data["n_ctx"];
+            if (n_ctx <= 0 || n_ctx > 1048576) {  // max 1M context
+                res_error(res,
+                          format_error_response("n_ctx must be between 1 and 1048576", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            params.n_ctx = n_ctx;
         }
         if (req_data.contains("n_parallel")) {
-            params.n_parallel = req_data["n_parallel"];
+            int n_parallel = req_data["n_parallel"];
+            if (n_parallel <= 0 || n_parallel > 128) {  // reasonable parallelism
+                res_error(res,
+                          format_error_response("n_parallel must be between 1 and 128", ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
+            params.n_parallel = n_parallel;
         }
 
         // Create job asynchronously
@@ -6470,7 +6499,20 @@ int main(int argc, char ** argv) {
         // Wait for completion (default 60 seconds timeout)
         int timeout_ms = 60000;
         if (req.has_param("timeout")) {
-            timeout_ms = std::stoi(req.get_param_value("timeout")) * 1000;
+            try {
+                int timeout_sec = std::stoi(req.get_param_value("timeout"));
+                // Validate range to prevent integer overflow and DoS
+                if (timeout_sec < 0 || timeout_sec > 600) {  // max 10 minutes
+                    res_error(res, format_error_response("timeout must be between 0 and 600 seconds",
+                                                         ERROR_TYPE_INVALID_REQUEST));
+                    return;
+                }
+                timeout_ms = timeout_sec * 1000;
+            } catch (const std::exception & e) {
+                res_error(res, format_error_response(std::string("Invalid timeout parameter: ") + e.what(),
+                                                     ERROR_TYPE_INVALID_REQUEST));
+                return;
+            }
         }
 
         bool completed = job->wait_for_completion(timeout_ms);
