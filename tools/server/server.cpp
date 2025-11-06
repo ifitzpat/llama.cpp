@@ -5156,8 +5156,6 @@ int main(int argc, char ** argv) {
     svr.reset(new httplib::Server());
 #endif
 
-    std::atomic<server_state> state{ SERVER_STATE_LOADING_MODEL };
-
     svr->set_default_headers({
         { "Server", "llama.cpp" }
     });
@@ -5259,22 +5257,54 @@ int main(int argc, char ** argv) {
         return false;
     };
 
-    auto middleware_server_state = [&res_error, &state](const httplib::Request & req, httplib::Response & res) {
-        server_state current_state = state.load();
+    auto middleware_server_state = [&res_error, &ctx_server](const httplib::Request & req, httplib::Response & res) {
+        server_state current_state = ctx_server.state.load();
+
+        // Define public endpoints that are always accessible
+        static const std::unordered_set<std::string> public_endpoints = { "/health",         "/v1/health",
+                                                                          "/models",         "/v1/models",
+                                                                          "/api/tags",       "/v1/models/status",
+                                                                          "/v1/models/jobs", "/v1/models/reset" };
+
+        // Check if this is a public endpoint or a model management endpoint
+        bool is_public     = public_endpoints.count(req.path) > 0;
+        bool is_model_mgmt = req.path.find("/v1/models/") == 0;
+
+        // Allow model management endpoints and public endpoints in any state
+        if (is_model_mgmt || is_public) {
+            return true;
+        }
+
+        // For all other endpoints, check state
         if (current_state == SERVER_STATE_LOADING_MODEL) {
             auto tmp = string_split<std::string>(req.path, '.');
             if (req.path == "/" || tmp.back() == "html") {
                 res.set_content(reinterpret_cast<const char *>(loading_html), loading_html_len,
                                 "text/html; charset=utf-8");
                 res.status = 503;
-            } else if (req.path == "/models" || req.path == "/v1/models" || req.path == "/api/tags") {
-                // allow the models endpoint to be accessed during loading
-                return true;
             } else {
-                res_error(res, format_error_response("Loading model", ERROR_TYPE_UNAVAILABLE));
+                res_error(res, format_error_response("Server is loading model", ERROR_TYPE_UNAVAILABLE));
             }
             return false;
         }
+
+        if (current_state == SERVER_STATE_TRANSITIONING) {
+            res_error(res, format_error_response("Server is transitioning (loading/unloading model)",
+                                                 ERROR_TYPE_UNAVAILABLE));
+            return false;
+        }
+
+        if (current_state == SERVER_STATE_NO_MODEL) {
+            res_error(res, format_error_response("No model loaded", ERROR_TYPE_UNAVAILABLE));
+            return false;
+        }
+
+        if (current_state == SERVER_STATE_ERROR) {
+            res_error(res, format_error_response("Server is in error state. Use POST /v1/models/reset to recover",
+                                                 ERROR_TYPE_UNAVAILABLE));
+            return false;
+        }
+
         return true;
     };
 
@@ -5909,9 +5939,8 @@ int main(int argc, char ** argv) {
         });
     };
 
-    const auto handle_models = [&params, &ctx_server, &state, &res_ok](const httplib::Request &,
-                                                                       httplib::Response & res) {
-        server_state current_state = state.load();
+    const auto handle_models = [&params, &ctx_server, &res_ok](const httplib::Request &, httplib::Response & res) {
+        server_state current_state = ctx_server.state.load();
         json         model_meta    = nullptr;
         if (current_state == SERVER_STATE_READY) {
             model_meta = ctx_server.model_meta();
@@ -6561,7 +6590,6 @@ int main(int argc, char ** argv) {
     }
 
     ctx_server.init();
-    state.store(SERVER_STATE_READY);
     ctx_server.state.store(SERVER_STATE_READY);
 
     // Wire up model_manager callbacks
