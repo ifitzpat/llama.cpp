@@ -2110,6 +2110,133 @@ struct model_job {
     }
 };
 
+struct model_manager {
+    std::vector<std::shared_ptr<model_job>>           job_queue;
+    std::map<std::string, std::shared_ptr<model_job>> jobs;
+    std::mutex                                        manager_mutex;
+    std::thread                                       worker_thread;
+    std::atomic<bool>                                 running{ false };
+    std::condition_variable                           cv_work;
+
+    // Forward declaration - will be set by server_context
+    std::function<bool(const common_params &)> execute_load_fn;
+    std::function<bool()>                      execute_unload_fn;
+    std::function<bool(const common_params &)> execute_reload_fn;
+
+    std::shared_ptr<model_job> create_job(model_job_type type, const common_params & params = common_params()) {
+        std::lock_guard<std::mutex> lock(manager_mutex);
+
+        auto job        = std::make_shared<model_job>();
+        job->job_id     = generate_job_id();
+        job->type       = type;
+        job->status     = MODEL_JOB_PENDING;
+        job->params     = params;
+        job->start_time = std::chrono::steady_clock::now();
+
+        jobs[job->job_id] = job;
+        job_queue.push_back(job);
+
+        cv_work.notify_one();
+
+        return job;
+    }
+
+    std::shared_ptr<model_job> get_job(const std::string & job_id) {
+        std::lock_guard<std::mutex> lock(manager_mutex);
+        auto                        it = jobs.find(job_id);
+        return (it != jobs.end()) ? it->second : nullptr;
+    }
+
+    void start_worker() {
+        running       = true;
+        worker_thread = std::thread(&model_manager::worker_loop, this);
+    }
+
+    void stop_worker() {
+        running = false;
+        cv_work.notify_all();
+        if (worker_thread.joinable()) {
+            worker_thread.join();
+        }
+    }
+
+    void worker_loop() {
+        while (running) {
+            std::shared_ptr<model_job> job;
+
+            {
+                std::unique_lock<std::mutex> lock(manager_mutex);
+                cv_work.wait(lock, [this]() { return !running || !job_queue.empty(); });
+
+                if (!running) {
+                    break;
+                }
+
+                if (!job_queue.empty()) {
+                    job = job_queue.front();
+                    job_queue.erase(job_queue.begin());
+                }
+            }
+
+            if (job) {
+                process_job(job);
+            }
+        }
+    }
+
+    void process_job(std::shared_ptr<model_job> job) {
+        job->set_status(MODEL_JOB_IN_PROGRESS);
+
+        bool success = false;
+        try {
+            switch (job->type) {
+                case MODEL_JOB_LOAD:
+                    if (execute_load_fn) {
+                        success = execute_load_fn(job->params);
+                    } else {
+                        job->set_status(MODEL_JOB_FAILED, "Load function not set");
+                        return;
+                    }
+                    break;
+
+                case MODEL_JOB_UNLOAD:
+                    if (execute_unload_fn) {
+                        success = execute_unload_fn();
+                    } else {
+                        job->set_status(MODEL_JOB_FAILED, "Unload function not set");
+                        return;
+                    }
+                    break;
+
+                case MODEL_JOB_RELOAD:
+                    if (execute_reload_fn) {
+                        success = execute_reload_fn(job->params);
+                    } else {
+                        job->set_status(MODEL_JOB_FAILED, "Reload function not set");
+                        return;
+                    }
+                    break;
+            }
+
+            if (success) {
+                job->set_status(MODEL_JOB_COMPLETED);
+            } else {
+                job->set_status(MODEL_JOB_FAILED, "Operation failed");
+            }
+        } catch (const std::exception & e) {
+            job->set_status(MODEL_JOB_FAILED, std::string("Exception: ") + e.what());
+        }
+    }
+
+  private:
+    std::string generate_job_id() {
+        static std::atomic<uint64_t> counter{ 0 };
+        auto                         now = std::chrono::system_clock::now();
+        auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        return "job_" + std::to_string(timestamp) + "_" + std::to_string(counter.fetch_add(1));
+    }
+};
+
 struct server_queue {
     int  id = 0;
     bool running;
