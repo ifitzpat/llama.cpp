@@ -24,6 +24,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -2234,6 +2235,113 @@ struct model_manager {
         auto                         now = std::chrono::system_clock::now();
         auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
         return "job_" + std::to_string(timestamp) + "_" + std::to_string(counter.fetch_add(1));
+    }
+};
+
+struct path_validator {
+    std::vector<std::string> allowed_paths;
+
+    void add_allowed_path(const std::string & path) { allowed_paths.push_back(normalize_path(path)); }
+
+    bool validate_model_path(const std::string & path, std::string & error) {
+        // Normalize the path
+        std::string normalized = normalize_path(path);
+
+        // Check if path is empty
+        if (normalized.empty()) {
+            error = "Path is empty";
+            return false;
+        }
+
+        // Check for directory traversal attempts
+        if (normalized.find("..") != std::string::npos) {
+            error = "Directory traversal detected in path";
+            return false;
+        }
+
+        // If whitelist is empty, allow any path (backward compatibility)
+        if (allowed_paths.empty()) {
+            return validate_gguf_file(normalized, error);
+        }
+
+        // Check if path starts with any allowed prefix
+        bool allowed = false;
+        for (const auto & allowed_path : allowed_paths) {
+            if (normalized.find(allowed_path) == 0) {
+                allowed = true;
+                break;
+            }
+        }
+
+        if (!allowed) {
+            error = "Path not in allowed directories";
+            return false;
+        }
+
+        // Verify it's a valid GGUF file
+        return validate_gguf_file(normalized, error);
+    }
+
+  private:
+    std::string normalize_path(const std::string & path) {
+        if (path.empty()) {
+            return "";
+        }
+
+        // Replace backslashes with forward slashes
+        std::string normalized = path;
+        for (size_t i = 0; i < normalized.length(); i++) {
+            if (normalized[i] == '\\') {
+                normalized[i] = '/';
+            }
+        }
+
+        // Remove duplicate slashes
+        std::string result;
+        result.reserve(normalized.length());
+        bool last_was_slash = false;
+        for (char c : normalized) {
+            if (c == '/') {
+                if (!last_was_slash) {
+                    result += c;
+                    last_was_slash = true;
+                }
+            } else {
+                result += c;
+                last_was_slash = false;
+            }
+        }
+
+        // Remove trailing slash
+        if (!result.empty() && result.back() == '/') {
+            result.pop_back();
+        }
+
+        return result;
+    }
+
+    bool validate_gguf_file(const std::string & path, std::string & error) {
+        // Check if file exists and is readable
+        std::ifstream file(path, std::ios::binary);
+        if (!file.good()) {
+            error = "Cannot open file: " + path;
+            return false;
+        }
+
+        // Read and verify GGUF magic number (first 4 bytes should be "GGUF")
+        char magic[4];
+        file.read(magic, 4);
+        if (!file.good() || file.gcount() != 4) {
+            error = "Cannot read file header";
+            return false;
+        }
+
+        if (magic[0] != 'G' || magic[1] != 'G' || magic[2] != 'U' || magic[3] != 'F') {
+            error = "Invalid GGUF file format (magic number mismatch)";
+            return false;
+        }
+
+        return true;
     }
 };
 
