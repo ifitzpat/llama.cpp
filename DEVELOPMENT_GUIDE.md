@@ -2,6 +2,14 @@
 
 This guide explains the development infrastructure and workflows for the model management feature.
 
+## Documentation Index
+
+📚 **Essential Reading (in order):**
+1. **[CLAUDE.md](CLAUDE.md)** - Project overview and status
+2. **[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)** - Complete implementation plan with critical fixes
+3. **[CODING_GUIDELINES_SUMMARY.md](CODING_GUIDELINES_SUMMARY.md)** - llama.cpp coding standards
+4. **This guide (DEVELOPMENT_GUIDE.md)** - Development workflow and tools
+
 ## Available Tools
 
 ### Compilers & Build Tools ✅
@@ -22,6 +30,59 @@ This guide explains the development infrastructure and workflows for the model m
 - **pytest 8.3.3** - Python-based testing (already used by llama.cpp)
 - Existing test infrastructure in `tools/server/tests/`
 - Fixtures and utilities for server testing
+
+## Coding Standards
+
+**⚠️ IMPORTANT:** This project follows llama.cpp's coding standards. See [CODING_GUIDELINES_SUMMARY.md](CODING_GUIDELINES_SUMMARY.md) for details.
+
+### Quick Reference
+
+```cpp
+// Naming: snake_case everywhere
+enum server_state {
+    SERVER_STATE_READY,           // UPPER_CASE enums with prefix
+};
+
+struct model_job {                // snake_case structs
+    std::string job_id;           // longest common prefix
+    int timeout_seconds;          // NOT seconds_timeout
+};
+
+bool server_context::unload_model();  // class_method pattern
+
+// Style: 4 spaces, brackets on same line
+void my_function() {              // ✅
+    for (size_t i = 0; i < n; i++) {  // Basic for loops
+        process(i);
+    }
+}
+
+// Avoid: fancy C++, templates
+template<typename T> ...          // ❌ Avoid unless necessary
+auto job = ...;                   // ❌ Prefer explicit types
+```
+
+### Commit Message Format
+
+For server changes, use:
+```
+server : <description> (#PR_number)
+```
+
+Examples:
+- `server : add model loading endpoint (#12345)`
+- `server : fix memory leak in job cleanup (#12346)`
+
+### Key Rules
+
+- ✅ **4 spaces** for indentation (not tabs)
+- ✅ **No trailing whitespace**
+- ✅ **LF line endings** (not CRLF)
+- ✅ **Simple C++** - no fancy STL, minimal templates
+- ✅ **Cross-platform** - test on Linux/Windows/macOS
+- ✅ **No third-party dependencies**
+
+Pre-commit hook enforces these automatically!
 
 ## Development Workflow Scripts
 
