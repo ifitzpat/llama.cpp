@@ -1998,6 +1998,118 @@ struct server_metrics {
     }
 };
 
+//
+// Model management job system
+//
+
+enum model_job_type {
+    MODEL_JOB_LOAD,
+    MODEL_JOB_UNLOAD,
+    MODEL_JOB_RELOAD,
+};
+
+enum model_job_status {
+    MODEL_JOB_PENDING,
+    MODEL_JOB_IN_PROGRESS,
+    MODEL_JOB_COMPLETED,
+    MODEL_JOB_FAILED,
+    MODEL_JOB_CANCELLED,
+};
+
+struct model_job {
+    std::string                           job_id;
+    model_job_type                        type;
+    std::atomic<model_job_status>         status;
+    common_params                         params;
+    std::atomic<int>                      progress_pct{ 0 };
+    std::string                           progress_msg;
+    std::chrono::steady_clock::time_point start_time;
+    std::chrono::steady_clock::time_point end_time;
+    std::string                           error_message;
+    mutable std::mutex                    job_mutex;
+    std::condition_variable               job_cv;
+
+    void set_progress(int pct, const std::string & msg) {
+        std::lock_guard<std::mutex> lock(job_mutex);
+        progress_pct.store(pct);
+        progress_msg = msg;
+    }
+
+    void set_status(model_job_status new_status, const std::string & error = "") {
+        std::lock_guard<std::mutex> lock(job_mutex);
+        status.store(new_status);
+        if (!error.empty()) {
+            error_message = error;
+        }
+        if (new_status == MODEL_JOB_COMPLETED || new_status == MODEL_JOB_FAILED) {
+            end_time = std::chrono::steady_clock::now();
+        }
+        job_cv.notify_all();
+    }
+
+    bool wait_for_completion(int timeout_ms = 0) {
+        std::unique_lock<std::mutex> lock(job_mutex);
+        if (timeout_ms == 0) {
+            job_cv.wait(lock, [this]() {
+                auto s = status.load();
+                return s == MODEL_JOB_COMPLETED || s == MODEL_JOB_FAILED || s == MODEL_JOB_CANCELLED;
+            });
+            return status.load() == MODEL_JOB_COMPLETED;
+        } else {
+            bool completed = job_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]() {
+                auto s = status.load();
+                return s == MODEL_JOB_COMPLETED || s == MODEL_JOB_FAILED || s == MODEL_JOB_CANCELLED;
+            });
+            return completed && status.load() == MODEL_JOB_COMPLETED;
+        }
+    }
+
+    json to_json() const {
+        std::lock_guard<std::mutex> lock(job_mutex);
+
+        std::string status_str;
+        switch (status.load()) {
+            case MODEL_JOB_PENDING:
+                status_str = "pending";
+                break;
+            case MODEL_JOB_IN_PROGRESS:
+                status_str = "in_progress";
+                break;
+            case MODEL_JOB_COMPLETED:
+                status_str = "completed";
+                break;
+            case MODEL_JOB_FAILED:
+                status_str = "failed";
+                break;
+            case MODEL_JOB_CANCELLED:
+                status_str = "cancelled";
+                break;
+        }
+
+        json j = {
+            { "job_id",           job_id              },
+            { "status",           status_str          },
+            { "progress",         progress_pct.load() },
+            { "progress_message", progress_msg        },
+        };
+
+        if (!error_message.empty()) {
+            j["error"] = error_message;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (status.load() == MODEL_JOB_IN_PROGRESS) {
+            auto elapsed         = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
+            j["elapsed_seconds"] = elapsed;
+        } else if (status.load() == MODEL_JOB_COMPLETED || status.load() == MODEL_JOB_FAILED) {
+            auto duration         = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
+            j["duration_seconds"] = duration;
+        }
+
+        return j;
+    }
+};
+
 struct server_queue {
     int  id = 0;
     bool running;
