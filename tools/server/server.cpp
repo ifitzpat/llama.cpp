@@ -2144,8 +2144,31 @@ struct model_manager {
 
     std::shared_ptr<model_job> get_job(const std::string & job_id) {
         std::lock_guard<std::mutex> lock(manager_mutex);
-        auto                        it = jobs.find(job_id);
+        cleanup_old_jobs();  // Opportunistic cleanup
+        auto it = jobs.find(job_id);
         return (it != jobs.end()) ? it->second : nullptr;
+    }
+
+    void cleanup_old_jobs() {
+        // Remove completed/failed jobs older than 5 minutes
+        // Note: caller must hold manager_mutex
+        auto now     = std::chrono::steady_clock::now();
+        auto max_age = std::chrono::minutes(5);
+        auto jobs_it = jobs.begin();
+        while (jobs_it != jobs.end()) {
+            auto job    = jobs_it->second;
+            auto status = job->status.load();
+            bool is_terminal =
+                (status == MODEL_JOB_COMPLETED || status == MODEL_JOB_FAILED || status == MODEL_JOB_CANCELLED);
+            if (is_terminal) {
+                auto age = std::chrono::duration_cast<std::chrono::minutes>(now - job->end_time);
+                if (age > max_age) {
+                    jobs_it = jobs.erase(jobs_it);
+                    continue;
+                }
+            }
+            ++jobs_it;
+        }
     }
 
     void start_worker() {
@@ -2752,6 +2775,9 @@ struct server_context {
     std::mutex                mutex_state;
 
     ~server_context() {
+        // Stop the model manager worker thread first to prevent use-after-free
+        mgr_model.stop_worker();
+
         mtmd_free(mctx);
 
         // Clear any sampling context
@@ -2948,8 +2974,8 @@ struct server_context {
         }
         slots.clear();
 
-        // Free batch
-        llama_batch_free(batch);
+        // Note: batch will be reinitialized by init() on next load
+        // Destructor will handle final cleanup
 
         // Free multimodal context
         mtmd_free(mctx);
