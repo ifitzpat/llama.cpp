@@ -2744,6 +2744,13 @@ struct server_context {
     common_chat_templates_ptr chat_templates;
     oaicompat_parser_options  oai_parser_opt;
 
+    // Model management
+    std::atomic<server_state> state{ SERVER_STATE_LOADING_MODEL };
+    model_manager             mgr_model;
+    path_validator            validator_path;
+    request_tracker           tracker_requests;
+    std::mutex                mutex_state;
+
     ~server_context() {
         mtmd_free(mctx);
 
@@ -2886,6 +2893,199 @@ struct server_context {
             }
         }
 
+        return true;
+    }
+
+    bool execute_unload() {
+        SRV_INF("%s", "starting model unload\n");
+
+        // Check current state
+        server_state current_state = state.load();
+        if (current_state != SERVER_STATE_READY) {
+            SRV_ERR("cannot unload: server not in READY state (current: %d)\n", current_state);
+            return false;
+        }
+
+        // Transition to TRANSITIONING state
+        {
+            std::lock_guard<std::mutex> lock(mutex_state);
+            if (!state.compare_exchange_strong(current_state, SERVER_STATE_TRANSITIONING)) {
+                SRV_ERR("%s", "state transition failed during unload\n");
+                return false;
+            }
+        }
+
+        SRV_INF("%s", "state transition: READY -> TRANSITIONING\n");
+
+        // Wait for active requests to complete
+        const int32_t drain_timeout_ms = 30000;  // 30 seconds
+        SRV_INF("waiting for %d active requests to complete (timeout: %d ms)\n", tracker_requests.get_count(),
+                drain_timeout_ms);
+
+        bool drained = tracker_requests.wait_for_completion(drain_timeout_ms);
+        if (!drained) {
+            SRV_WRN("timeout waiting for requests to complete (%d still active)\n", tracker_requests.get_count());
+            // Continue anyway - the requests will be forcefully terminated
+        } else {
+            SRV_INF("%s", "all requests completed successfully\n");
+        }
+
+        // Clear slots
+        for (server_slot & slot : slots) {
+            if (slot.is_processing()) {
+                slot.release();
+            }
+            common_sampler_free(slot.smpl);
+            slot.smpl = nullptr;
+
+            llama_free(slot.ctx_dft);
+            slot.ctx_dft = nullptr;
+
+            common_speculative_free(slot.spec);
+            slot.spec = nullptr;
+
+            llama_batch_free(slot.batch_spec);
+        }
+        slots.clear();
+
+        // Free batch
+        llama_batch_free(batch);
+
+        // Free multimodal context
+        mtmd_free(mctx);
+        mctx = nullptr;
+
+        // Release llama_init (this frees model and context)
+        llama_init     = common_init_result();
+        llama_init_dft = common_init_result();
+
+        model     = nullptr;
+        ctx       = nullptr;
+        vocab     = nullptr;
+        model_dft = nullptr;
+
+        // Clear prompt cache
+        prompt_cache.reset();
+
+        SRV_INF("%s", "model unloaded successfully\n");
+
+        // Transition to NO_MODEL state
+        {
+            std::lock_guard<std::mutex> lock(mutex_state);
+            state.store(SERVER_STATE_NO_MODEL);
+        }
+
+        SRV_INF("%s", "state transition: TRANSITIONING -> NO_MODEL\n");
+
+        return true;
+    }
+
+    bool execute_load(const common_params & params) {
+        SRV_INF("starting model load: %s\n", params.model.path.c_str());
+
+        // Validate the model path
+        std::string error;
+        if (!validator_path.validate_model_path(params.model.path, error)) {
+            SRV_ERR("model path validation failed: %s\n", error.c_str());
+            return false;
+        }
+
+        // Check current state
+        server_state current_state = state.load();
+        if (current_state != SERVER_STATE_NO_MODEL && current_state != SERVER_STATE_LOADING_MODEL) {
+            SRV_ERR("cannot load: server not in NO_MODEL state (current: %d)\n", current_state);
+            return false;
+        }
+
+        // Transition to TRANSITIONING state
+        {
+            std::lock_guard<std::mutex> lock(mutex_state);
+            server_state                expected = current_state;
+            if (!state.compare_exchange_strong(expected, SERVER_STATE_TRANSITIONING)) {
+                SRV_ERR("%s", "state transition failed during load\n");
+                return false;
+            }
+        }
+
+        SRV_INF("state transition: %d -> TRANSITIONING\n", current_state);
+
+        // Load the model
+        bool load_success = load_model(params);
+        if (!load_success) {
+            SRV_ERR("%s", "model loading failed\n");
+            // Transition to ERROR state
+            {
+                std::lock_guard<std::mutex> lock(mutex_state);
+                state.store(SERVER_STATE_ERROR);
+            }
+            SRV_INF("%s", "state transition: TRANSITIONING -> ERROR\n");
+            return false;
+        }
+
+        // Initialize slots
+        init();
+
+        SRV_INF("%s", "model loaded successfully\n");
+
+        // Transition to READY state
+        {
+            std::lock_guard<std::mutex> lock(mutex_state);
+            state.store(SERVER_STATE_READY);
+        }
+
+        SRV_INF("%s", "state transition: TRANSITIONING -> READY\n");
+
+        return true;
+    }
+
+    bool execute_reload(const common_params & params) {
+        SRV_INF("starting model reload: %s\n", params.model.path.c_str());
+
+        // Validate the model path
+        std::string error;
+        if (!validator_path.validate_model_path(params.model.path, error)) {
+            SRV_ERR("model path validation failed: %s\n", error.c_str());
+            return false;
+        }
+
+        // Check current state
+        server_state current_state = state.load();
+        if (current_state != SERVER_STATE_READY) {
+            SRV_ERR("cannot reload: server not in READY state (current: %d)\n", current_state);
+            return false;
+        }
+
+        // Save snapshot of current state for potential rollback
+        common_params snapshot_params = params_base;
+        SRV_INF("%s", "saved state snapshot for rollback\n");
+
+        // Unload current model
+        bool unload_success = execute_unload();
+        if (!unload_success) {
+            SRV_ERR("%s", "failed to unload current model during reload\n");
+            return false;
+        }
+
+        // Load new model
+        bool load_success = execute_load(params);
+        if (!load_success) {
+            SRV_ERR("%s", "failed to load new model, attempting rollback\n");
+
+            // Attempt rollback to previous model
+            SRV_INF("rolling back to previous model: %s\n", snapshot_params.model.path.c_str());
+            bool rollback_success = execute_load(snapshot_params);
+
+            if (rollback_success) {
+                SRV_INF("%s", "rollback successful, restored previous model\n");
+                return false;  // Reload failed but we recovered
+            } else {
+                SRV_ERR("%s", "CRITICAL: rollback failed, server in ERROR state\n");
+                // State is already ERROR from execute_load failure
+                return false;
+            }
+        }
+
+        SRV_INF("%s", "model reload completed successfully\n");
         return true;
     }
 
