@@ -6305,6 +6305,152 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // Model management endpoint handlers
+    const auto handle_models_load = [&ctx_server, &res_error](const httplib::Request & req, httplib::Response & res) {
+        json req_data = json::parse(req.body);
+
+        // Extract model path and parameters
+        std::string model_path = req_data.value("model", "");
+        if (model_path.empty()) {
+            res_error(res, format_error_response("model path is required", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        // Build common_params from request
+        common_params params = ctx_server.params_base;  // Start with base params
+        params.model.path    = model_path;
+
+        // Optional parameters
+        if (req_data.contains("n_gpu_layers")) {
+            params.n_gpu_layers = req_data["n_gpu_layers"];
+        }
+        if (req_data.contains("n_ctx")) {
+            params.n_ctx = req_data["n_ctx"];
+        }
+        if (req_data.contains("n_parallel")) {
+            params.n_parallel = req_data["n_parallel"];
+        }
+
+        // Create job asynchronously
+        auto job = ctx_server.mgr_model.create_job(MODEL_JOB_LOAD, params);
+
+        json response = {
+            { "job_id",  job->job_id              },
+            { "status",  "accepted"               },
+            { "message", "Model load job created" }
+        };
+
+        res.set_content(safe_json_to_str(response), MIMETYPE_JSON);
+        res.status = 202;  // 202 Accepted
+    };
+
+    const auto handle_models_unload = [&ctx_server](const httplib::Request &, httplib::Response & res) {
+        // Create unload job
+        auto job = ctx_server.mgr_model.create_job(MODEL_JOB_UNLOAD);
+
+        json response = {
+            { "job_id",  job->job_id                },
+            { "status",  "accepted"                 },
+            { "message", "Model unload job created" }
+        };
+
+        res.set_content(safe_json_to_str(response), MIMETYPE_JSON);
+        res.status = 202;  // 202 Accepted
+    };
+
+    const auto handle_models_status = [&ctx_server, &res_ok](const httplib::Request &, httplib::Response & res) {
+        server_state current_state = ctx_server.state.load();
+
+        std::string state_str;
+        switch (current_state) {
+            case SERVER_STATE_LOADING_MODEL:
+                state_str = "loading_model";
+                break;
+            case SERVER_STATE_READY:
+                state_str = "ready";
+                break;
+            case SERVER_STATE_TRANSITIONING:
+                state_str = "transitioning";
+                break;
+            case SERVER_STATE_NO_MODEL:
+                state_str = "no_model";
+                break;
+            case SERVER_STATE_ERROR:
+                state_str = "error";
+                break;
+        }
+
+        json response = {
+            { "state",           state_str                               },
+            { "model",           ctx_server.params_base.model.path       },
+            { "active_requests", ctx_server.tracker_requests.get_count() }
+        };
+
+        res_ok(res, response);
+    };
+
+    const auto handle_models_job_status = [&ctx_server, &res_error, &res_ok](const httplib::Request & req,
+                                                                             httplib::Response &      res) {
+        std::string job_id = req.path_params.at("job_id");
+
+        auto job = ctx_server.mgr_model.get_job(job_id);
+        if (!job) {
+            res_error(res, format_error_response("Job not found", ERROR_TYPE_NOT_FOUND));
+            return;
+        }
+
+        res_ok(res, job->to_json());
+    };
+
+    const auto handle_models_job_wait = [&ctx_server, &res_error, &res_ok](const httplib::Request & req,
+                                                                           httplib::Response &      res) {
+        std::string job_id = req.path_params.at("job_id");
+
+        auto job = ctx_server.mgr_model.get_job(job_id);
+        if (!job) {
+            res_error(res, format_error_response("Job not found", ERROR_TYPE_NOT_FOUND));
+            return;
+        }
+
+        // Wait for completion (default 60 seconds timeout)
+        int timeout_ms = 60000;
+        if (req.has_param("timeout")) {
+            timeout_ms = std::stoi(req.get_param_value("timeout")) * 1000;
+        }
+
+        bool completed = job->wait_for_completion(timeout_ms);
+
+        json response = job->to_json();
+        if (!completed) {
+            response["timeout"] = true;
+        }
+
+        res_ok(res, response);
+    };
+
+    const auto handle_models_reset = [&ctx_server, &res_error, &res_ok](const httplib::Request &,
+                                                                        httplib::Response & res) {
+        server_state current_state = ctx_server.state.load();
+
+        if (current_state != SERVER_STATE_ERROR) {
+            res_error(res, format_error_response("Server not in error state", ERROR_TYPE_INVALID_REQUEST));
+            return;
+        }
+
+        // Transition to NO_MODEL state to allow recovery
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.mutex_state);
+            ctx_server.state.store(SERVER_STATE_NO_MODEL);
+        }
+
+        json response = {
+            { "status",  "ok"                            },
+            { "message", "Server reset from error state" }
+        };
+
+        res_ok(res, response);
+    };
+
     // register API routes
     svr->Get(params.api_prefix + "/health", handle_health);     // public endpoint (no API key check)
     svr->Get(params.api_prefix + "/v1/health", handle_health);  // public endpoint (no API key check)
@@ -6339,6 +6485,13 @@ int main(int argc, char ** argv) {
     // Save & load slots
     svr->Get(params.api_prefix + "/slots", handle_slots);
     svr->Post(params.api_prefix + "/slots/:id_slot", handle_slots_action);
+    // Model management endpoints
+    svr->Post(params.api_prefix + "/v1/models/load", handle_models_load);
+    svr->Post(params.api_prefix + "/v1/models/unload", handle_models_unload);
+    svr->Get(params.api_prefix + "/v1/models/status", handle_models_status);
+    svr->Get(params.api_prefix + "/v1/models/jobs/:job_id", handle_models_job_status);
+    svr->Get(params.api_prefix + "/v1/models/jobs/:job_id/wait", handle_models_job_wait);
+    svr->Post(params.api_prefix + "/v1/models/reset", handle_models_reset);
 
     //
     // Start the server
@@ -6355,6 +6508,7 @@ int main(int argc, char ** argv) {
     // clean up function, to be called before exit
     auto clean_up = [&svr, &ctx_server]() {
         SRV_INF("%s: cleaning up before exit...\n", __func__);
+        ctx_server.mgr_model.stop_worker();
         svr->stop();
         ctx_server.queue_results.terminate();
         llama_backend_free();
@@ -6408,6 +6562,21 @@ int main(int argc, char ** argv) {
 
     ctx_server.init();
     state.store(SERVER_STATE_READY);
+    ctx_server.state.store(SERVER_STATE_READY);
+
+    // Wire up model_manager callbacks
+    ctx_server.mgr_model.execute_load_fn = [&ctx_server](const common_params & params) {
+        return ctx_server.execute_load(params);
+    };
+    ctx_server.mgr_model.execute_unload_fn = [&ctx_server]() {
+        return ctx_server.execute_unload();
+    };
+    ctx_server.mgr_model.execute_reload_fn = [&ctx_server](const common_params & params) {
+        return ctx_server.execute_reload(params);
+    };
+
+    // Start model manager worker thread
+    ctx_server.mgr_model.start_worker();
 
     LOG_INF("%s: model loaded\n", __func__);
 
