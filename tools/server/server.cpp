@@ -2345,6 +2345,69 @@ struct path_validator {
     }
 };
 
+struct request_tracker {
+    std::atomic<int32_t>    active_request_count{ 0 };
+    std::condition_variable cv_requests;
+    std::mutex              mutex_requests;
+
+    void increment() { active_request_count.fetch_add(1); }
+
+    void decrement() {
+        active_request_count.fetch_sub(1);
+        cv_requests.notify_all();
+    }
+
+    int32_t get_count() const { return active_request_count.load(); }
+
+    bool wait_for_completion(int32_t timeout_ms) {
+        std::unique_lock<std::mutex> lock(mutex_requests);
+
+        if (timeout_ms == 0) {
+            // Wait indefinitely
+            cv_requests.wait(lock, [this]() { return active_request_count.load() == 0; });
+            return true;
+        } else {
+            // Wait with timeout
+            return cv_requests.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+                                        [this]() { return active_request_count.load() == 0; });
+        }
+    }
+};
+
+struct request_guard {
+    request_tracker * tracker;
+
+    explicit request_guard(request_tracker * t) : tracker(t) {
+        if (tracker) {
+            tracker->increment();
+        }
+    }
+
+    ~request_guard() {
+        if (tracker) {
+            tracker->decrement();
+        }
+    }
+
+    // Delete copy operations to ensure RAII semantics
+    request_guard(const request_guard &)             = delete;
+    request_guard & operator=(const request_guard &) = delete;
+
+    // Allow move operations
+    request_guard(request_guard && other) noexcept : tracker(other.tracker) { other.tracker = nullptr; }
+
+    request_guard & operator=(request_guard && other) noexcept {
+        if (this != &other) {
+            if (tracker) {
+                tracker->decrement();
+            }
+            tracker       = other.tracker;
+            other.tracker = nullptr;
+        }
+        return *this;
+    }
+};
+
 struct server_queue {
     int  id = 0;
     bool running;
