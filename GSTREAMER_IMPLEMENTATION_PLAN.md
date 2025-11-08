@@ -77,6 +77,72 @@ Implement a GStreamer element that wraps llama.cpp for text generation, featurin
 
 ---
 
+## Build System: GNU Guix
+
+This project uses **GNU Guix** for reproducible, declarative builds.
+
+### Why Guix?
+
+- **Reproducibility**: Bit-for-bit reproducible builds
+- **Isolation**: Each build in a pure environment
+- **Dependency Management**: Automatic dependency resolution
+- **Multiple Outputs**: Separate packages for C API, GStreamer plugin, Lisp bindings
+- **CI Integration**: GitHub Actions workflow for automated builds
+
+### Guix Package Structure
+
+The `guix.scm` file defines multiple packages:
+
+1. **llama-cpp-base** - Core llama.cpp libraries (libllama, libcommon)
+2. **llama-simple** - C API wrapper for FFI
+3. **gst-llama** - GStreamer plugin
+4. **gst-llama-steering** - Adaptive steering element
+5. **cl-llama-simple** - Common Lisp bindings (optional)
+6. **llama-gstreamer-all** - Meta-package (installs everything)
+7. **llama-gstreamer-dev** - Development environment
+
+### Quick Start with Guix
+
+```bash
+# Build specific package
+guix build -f guix.scm llama-simple
+
+# Build all packages
+guix build -f guix.scm
+
+# Enter development shell (all dependencies)
+guix shell -D -f guix.scm
+
+# Install locally
+guix package -f guix.scm
+```
+
+### GitHub Actions CI
+
+Automated builds run on every push:
+
+```bash
+# Monitor build status
+./scripts/ci/monitor-guix-build.sh --watch
+
+# Trigger manual build
+./scripts/ci/trigger-guix-build.sh --branch <branch-name>
+
+# View workflow
+gh run list --workflow=guix-build.yml
+```
+
+See `scripts/ci/README.md` for detailed CI documentation.
+
+### Traditional Build Systems
+
+For environments without Guix, traditional build systems are still supported:
+
+- **C API (llama-simple)**: CMake in `tools/ffi/CMakeLists.txt`
+- **GStreamer Plugin**: Meson in `tools/gstreamer/meson.build`
+
+---
+
 ## Phase 0: Foundation (C API Wrapper)
 
 **Duration:** 3-4 days
