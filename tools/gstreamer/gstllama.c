@@ -441,6 +441,9 @@ static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStat
 
                 self->model_loaded = TRUE;
                 GST_INFO_OBJECT(self, "Model loaded: %s", self->model_path);
+
+                /* Emit model-loaded signal */
+                g_signal_emit(self, gst_llama_signals[SIGNAL_MODEL_LOADED], 0, self->model_path);
             }
             g_mutex_unlock(&self->lock);
             break;
@@ -462,6 +465,9 @@ static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStat
                 llama_simple_unload_model(self->llama_ctx);
                 self->model_loaded = FALSE;
                 GST_INFO_OBJECT(self, "Model unloaded");
+
+                /* Emit model-unloaded signal */
+                g_signal_emit(self, gst_llama_signals[SIGNAL_MODEL_UNLOADED], 0);
             }
             g_mutex_unlock(&self->lock);
             break;
