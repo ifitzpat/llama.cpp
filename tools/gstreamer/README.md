@@ -1,6 +1,6 @@
 # GStreamer llama.cpp Plugin
 
-**Phase:** 3 - Control Pad
+**Phase:** 4 - Error Handling & Production Features
 **Status:** ✅ Implementation Complete
 
 ## Overview
@@ -16,6 +16,8 @@
 - **Thread-safe** - Proper locking for concurrent access
 - **GObject signals** - Real-time events for tokens, generation progress, and model lifecycle
 - **Control pad** - Runtime parameter adjustment via JSON control messages
+- **Error handling** - Comprehensive error detection, timeout protection, and graceful recovery
+- **Production-ready** - Input validation, detailed error messages, robust state management
 
 ## Architecture
 
@@ -46,6 +48,7 @@
 | `max-tokens` | int | 512 | Maximum tokens to generate |
 | `stream-tokens` | boolean | TRUE | Stream individual tokens |
 | `seed` | int | -1 | Random seed (-1=random) |
+| `generation-timeout` | int | 300 | Timeout for generation in seconds (0=no timeout) |
 
 ## Signals
 
@@ -476,21 +479,98 @@ pipeline.set_state(Gst.State.NULL)
 
 ## Error Handling
 
+The plugin includes comprehensive error handling and recovery mechanisms.
+
+### Error Types
+
 The element can emit errors in the following cases:
 
-- **RESOURCE/OPEN_READ:** Failed to load model
+**Model Loading Errors:**
+- **RESOURCE/NOT_FOUND:** Model file doesn't exist at specified path
+- **RESOURCE/OPEN_READ:** Model path is not a regular file (e.g., directory)
+- **RESOURCE/FAILED:** Failed to initialize llama context (out of memory)
+- **RESOURCE/READ:** Failed to load GGUF model (corrupted or incompatible file)
+
+**Generation Errors:**
 - **CORE/FAILED:** No model loaded when trying to generate
-- **STREAM/FAILED:** Generation failed
+- **STREAM/FAILED:** Generation failed or timeout exceeded
 
-Example error handling in Python:
+### Timeout Protection
 
+Generation can be time-limited using the `generation-timeout` property:
+
+```bash
+# Set 60 second timeout
+gst-launch-1.0 \
+    filesrc location=prompt.txt ! \
+    llama model=model.gguf generation-timeout=60 ! \
+    filesink location=output.txt
+```
+
+**Timeout Behavior:**
+- Default: 300 seconds (5 minutes)
+- Set to 0 to disable timeout
+- When exceeded, generation is aborted and `generation-complete` signal emits with `stop_reason="timeout"`
+- GST_ELEMENT_ERROR is posted to the bus
+
+### Error Recovery
+
+**Automatic Recovery:**
+- Buffer allocation failures abort generation gracefully
+- Timeout aborts don't crash the pipeline
+- State transitions cleanup ongoing generation
+- Failed model loads don't leave element in invalid state
+
+**Manual Recovery:**
+- Pipeline can be restarted after errors
+- Model can be changed via property and state transition
+- Control pad can adjust parameters after errors
+
+### Error Handling Example
+
+**Python:**
 ```python
 bus = pipeline.get_bus()
 msg = bus.timed_pop_filtered(Gst.CLOCK_TIME_NONE, Gst.MessageType.ERROR)
 if msg:
     err, debug = msg.parse_error()
     print(f"Error: {err.message}")
+    print(f"Debug: {debug}")
+
+    # Attempt recovery
+    pipeline.set_state(Gst.State.NULL)
+    pipeline.set_state(Gst.State.PLAYING)
 ```
+
+**C:**
+```c
+GstMessage *msg = gst_bus_timed_pop_filtered(bus, GST_CLOCK_TIME_NONE,
+                                             GST_MESSAGE_ERROR);
+if (msg) {
+    GError *err;
+    gchar *debug_info;
+    gst_message_parse_error(msg, &err, &debug_info);
+
+    g_printerr("Error from %s: %s\n",
+               GST_OBJECT_NAME(msg->src), err->message);
+    g_printerr("Debug info: %s\n", debug_info ? debug_info : "none");
+
+    g_error_free(err);
+    g_free(debug_info);
+    gst_message_unref(msg);
+}
+```
+
+### Validation
+
+**Control Message Validation:**
+- Temperature: 0.0-2.0
+- Top-P: 0.0-1.0
+- Top-K: >= 0
+- Max tokens: > 0
+- Repeat penalty: >= 0.0
+
+Invalid values are rejected with GST_WARNING and not applied.
 
 ## Performance Notes
 
@@ -517,12 +597,12 @@ export GST_DEBUG=*:3,llama:5
 gst-launch-1.0 ... (your pipeline)
 ```
 
-## Limitations (Phase 3)
+## Limitations
 
-- **Single model:** Only one model at a time
-- **Basic text I/O:** Advanced features (chat templates, etc.) in later phases
-- **Limited statistics:** generation-complete signal currently uses placeholders for full_text
-- **Control commands:** Currently only `set_params` supported (logit bias requires C API extensions)
+- **Single model:** Only one model at a time per element instance
+- **Basic text I/O:** Advanced features (chat templates, multi-turn conversations) not yet implemented
+- **Limited statistics:** generation-complete signal uses placeholders for full_text tracking
+- **Control commands:** Currently only `set_params` supported (logit bias and steering require C API extensions)
 
 ## Files
 
@@ -565,5 +645,11 @@ See main llama.cpp [CONTRIBUTING.md](../../CONTRIBUTING.md)
 ---
 
 **Last Updated:** 2025-11-08
-**Phase:** 3 - Control Pad
+**Phase:** 4 - Error Handling & Production Features
 **Status:** ✅ Complete
+
+**Implemented Phases:**
+- ✅ Phase 1: Basic GStreamer Element (text I/O, properties, state management)
+- ✅ Phase 2: Signal System (5 signals for real-time events)
+- ✅ Phase 3: Control Pad (runtime parameter adjustment)
+- ✅ Phase 4: Error Handling & Recovery (timeout, validation, error messages)

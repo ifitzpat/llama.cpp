@@ -44,6 +44,7 @@ struct _GstLlama {
     gint     max_tokens;
     gboolean stream_tokens;
     gint     seed;
+    gint     generation_timeout; /* Timeout in seconds (0 = no timeout) */
 
     /* State */
     gboolean model_loaded;
@@ -56,6 +57,8 @@ struct _GstLlama {
     /* Generation state */
     gboolean generating;
     gboolean eos_received;
+    gboolean generation_aborted;    /* Flag for timeout/error aborts */
+    gint64   generation_start_time; /* Start time for timeout tracking */
 };
 
 G_END_DECLS

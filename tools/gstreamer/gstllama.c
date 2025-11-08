@@ -38,6 +38,7 @@ enum {
     PROP_MAX_TOKENS,
     PROP_STREAM_TOKENS,
     PROP_SEED,
+    PROP_GENERATION_TIMEOUT,
     PROP_LAST
 };
 
@@ -49,9 +50,10 @@ enum {
 #define DEFAULT_TOP_P          0.9f
 #define DEFAULT_TOP_K          40
 #define DEFAULT_REPEAT_PENALTY 1.1f
-#define DEFAULT_MAX_TOKENS     512
-#define DEFAULT_STREAM_TOKENS  TRUE
-#define DEFAULT_SEED           -1
+#define DEFAULT_MAX_TOKENS         512
+#define DEFAULT_STREAM_TOKENS      TRUE
+#define DEFAULT_SEED               -1
+#define DEFAULT_GENERATION_TIMEOUT 300 /* 5 minutes default timeout */
 
 /* Signals */
 enum {
@@ -91,6 +93,21 @@ static gboolean token_callback(void *       user_data,
     GstFlowReturn ret;
     gsize         token_len;
 
+    /* Check for timeout */
+    if (self->generation_timeout > 0) {
+        gint64 elapsed = (g_get_monotonic_time() - self->generation_start_time) / G_USEC_PER_SEC;
+        if (elapsed > self->generation_timeout) {
+            GST_WARNING_OBJECT(self, "Generation timeout after %" G_GINT64_FORMAT " seconds", elapsed);
+            self->generation_aborted = TRUE;
+            return FALSE; /* Abort generation */
+        }
+    }
+
+    /* Check if generation was aborted */
+    if (self->generation_aborted) {
+        return FALSE;
+    }
+
     if (!self->stream_tokens) {
         /* Not streaming, accumulate tokens internally */
         return TRUE;
@@ -103,6 +120,12 @@ static gboolean token_callback(void *       user_data,
 
     /* Create buffer for token */
     outbuf = gst_buffer_new_allocate(NULL, token_len, NULL);
+    if (!outbuf) {
+        GST_ERROR_OBJECT(self, "Failed to allocate buffer for token (size=%zu)", token_len);
+        self->generation_aborted = TRUE;
+        return FALSE; /* Abort on allocation failure */
+    }
+
     gst_buffer_fill(outbuf, 0, token_text, token_len);
 
     GST_LOG_OBJECT(self, "Pushing token: '%s' (id=%d, prob=%.4f, pos=%d)", token_text, token_id, probability, position);
@@ -184,6 +207,12 @@ static void gst_llama_class_init(GstLlamaClass * klass) {
         gobject_class, PROP_SEED,
         g_param_spec_int("seed", "Random Seed", "Random seed (-1 for random)", -1, G_MAXINT32, DEFAULT_SEED,
                          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+    g_object_class_install_property(
+        gobject_class, PROP_GENERATION_TIMEOUT,
+        g_param_spec_int("generation-timeout", "Generation Timeout",
+                         "Timeout for generation in seconds (0 = no timeout)", 0, G_MAXINT32,
+                         DEFAULT_GENERATION_TIMEOUT, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
     /* Register signals */
     /**
@@ -286,15 +315,18 @@ static void gst_llama_init(GstLlama * self) {
     self->top_p          = DEFAULT_TOP_P;
     self->top_k          = DEFAULT_TOP_K;
     self->repeat_penalty = DEFAULT_REPEAT_PENALTY;
-    self->max_tokens     = DEFAULT_MAX_TOKENS;
-    self->stream_tokens  = DEFAULT_STREAM_TOKENS;
-    self->seed           = DEFAULT_SEED;
+    self->max_tokens         = DEFAULT_MAX_TOKENS;
+    self->stream_tokens      = DEFAULT_STREAM_TOKENS;
+    self->seed               = DEFAULT_SEED;
+    self->generation_timeout = DEFAULT_GENERATION_TIMEOUT;
 
     /* Initialize state */
-    self->model_loaded = FALSE;
-    self->generating   = FALSE;
-    self->eos_received = FALSE;
-    self->llama_ctx    = NULL;
+    self->model_loaded          = FALSE;
+    self->generating            = FALSE;
+    self->eos_received          = FALSE;
+    self->generation_aborted    = FALSE;
+    self->generation_start_time = 0;
+    self->llama_ctx             = NULL;
 
     g_mutex_init(&self->lock);
     g_cond_init(&self->cond);
@@ -340,6 +372,9 @@ static void gst_llama_set_property(GObject * object, guint prop_id, const GValue
             break;
         case PROP_SEED:
             self->seed = g_value_get_int(value);
+            break;
+        case PROP_GENERATION_TIMEOUT:
+            self->generation_timeout = g_value_get_int(value);
             break;
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -388,6 +423,9 @@ static void gst_llama_get_property(GObject * object, guint prop_id, GValue * val
         case PROP_SEED:
             g_value_set_int(value, self->seed);
             break;
+        case PROP_GENERATION_TIMEOUT:
+            g_value_set_int(value, self->generation_timeout);
+            break;
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
             break;
@@ -400,15 +438,21 @@ static void gst_llama_get_property(GObject * object, guint prop_id, GValue * val
 static void gst_llama_finalize(GObject * object) {
     GstLlama * self = GST_LLAMA(object);
 
+    GST_DEBUG_OBJECT(self, "Finalizing llama element");
+
     g_free(self->model_path);
+    self->model_path = NULL;
 
     if (self->llama_ctx) {
+        GST_DEBUG_OBJECT(self, "Freeing llama context");
         llama_simple_free(self->llama_ctx);
         self->llama_ctx = NULL;
     }
 
     g_mutex_clear(&self->lock);
     g_cond_clear(&self->cond);
+
+    GST_DEBUG_OBJECT(self, "Finalization complete");
 
     G_OBJECT_CLASS(parent_class)->finalize(object);
 }
@@ -428,6 +472,23 @@ static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStat
             /* Load model if path is set */
             g_mutex_lock(&self->lock);
             if (self->model_path && !self->model_loaded) {
+                /* Validate model path exists */
+                if (!g_file_test(self->model_path, G_FILE_TEST_EXISTS)) {
+                    g_mutex_unlock(&self->lock);
+                    GST_ELEMENT_ERROR(self, RESOURCE, NOT_FOUND, ("Model file not found: %s", self->model_path),
+                                      ("Check that the file exists and the path is correct"));
+                    return GST_STATE_CHANGE_FAILURE;
+                }
+
+                if (!g_file_test(self->model_path, G_FILE_TEST_IS_REGULAR)) {
+                    g_mutex_unlock(&self->lock);
+                    GST_ELEMENT_ERROR(self, RESOURCE, OPEN_READ, ("Model path is not a regular file: %s", self->model_path),
+                                      ("Path may be a directory or special file"));
+                    return GST_STATE_CHANGE_FAILURE;
+                }
+
+                GST_INFO_OBJECT(self, "Loading model from: %s", self->model_path);
+
                 llama_simple_params params = { 0 };
                 params.n_ctx               = self->n_ctx;
                 params.n_gpu_layers        = self->n_gpu_layers;
@@ -438,7 +499,8 @@ static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStat
                 self->llama_ctx = llama_simple_init(&params);
                 if (!self->llama_ctx) {
                     g_mutex_unlock(&self->lock);
-                    GST_ELEMENT_ERROR(self, RESOURCE, OPEN_READ, ("Failed to initialize llama context"), (NULL));
+                    GST_ELEMENT_ERROR(self, RESOURCE, FAILED, ("Failed to initialize llama context"),
+                                      ("Out of memory or initialization error"));
                     return GST_STATE_CHANGE_FAILURE;
                 }
 
@@ -446,17 +508,29 @@ static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStat
                 if (result != LLAMA_SIMPLE_OK) {
                     const char * error = llama_simple_get_error(self->llama_ctx);
                     g_mutex_unlock(&self->lock);
-                    GST_ELEMENT_ERROR(self, RESOURCE, OPEN_READ, ("Failed to load model: %s", error), (NULL));
+
+                    /* Provide more specific error messages */
+                    if (g_str_has_suffix(self->model_path, ".gguf")) {
+                        GST_ELEMENT_ERROR(self, RESOURCE, READ, ("Failed to load GGUF model: %s", error),
+                                          ("File may be corrupted or incompatible. Verify with llama-cli"));
+                    } else {
+                        GST_ELEMENT_ERROR(self, RESOURCE, READ, ("Failed to load model: %s", error),
+                                          ("Only GGUF format is supported. File must have .gguf extension"));
+                    }
+
                     llama_simple_free(self->llama_ctx);
                     self->llama_ctx = NULL;
                     return GST_STATE_CHANGE_FAILURE;
                 }
 
                 self->model_loaded = TRUE;
-                GST_INFO_OBJECT(self, "Model loaded: %s", self->model_path);
+                GST_INFO_OBJECT(self, "Model loaded successfully: %s (ctx=%d, gpu_layers=%d)", self->model_path, self->n_ctx,
+                                self->n_gpu_layers);
 
                 /* Emit model-loaded signal */
                 g_signal_emit(self, gst_llama_signals[SIGNAL_MODEL_LOADED], 0, self->model_path);
+            } else if (!self->model_path) {
+                GST_WARNING_OBJECT(self, "No model path set, cannot load model");
             }
             g_mutex_unlock(&self->lock);
             break;
@@ -474,7 +548,17 @@ static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStat
         case GST_STATE_CHANGE_PAUSED_TO_READY:
             /* Unload model */
             g_mutex_lock(&self->lock);
+
+            /* Abort any ongoing generation */
+            if (self->generating) {
+                GST_WARNING_OBJECT(self, "Aborting ongoing generation during state change");
+                self->generation_aborted = TRUE;
+                /* Give generation a moment to abort */
+                g_cond_wait_until(&self->cond, &self->lock, g_get_monotonic_time() + 1 * G_TIME_SPAN_SECOND);
+            }
+
             if (self->llama_ctx && self->model_loaded) {
+                GST_DEBUG_OBJECT(self, "Unloading model");
                 llama_simple_unload_model(self->llama_ctx);
                 self->model_loaded = FALSE;
                 GST_INFO_OBJECT(self, "Model unloaded");
@@ -482,6 +566,12 @@ static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStat
                 /* Emit model-unloaded signal */
                 g_signal_emit(self, gst_llama_signals[SIGNAL_MODEL_UNLOADED], 0);
             }
+
+            /* Reset state */
+            self->generating         = FALSE;
+            self->generation_aborted = FALSE;
+            self->eos_received       = FALSE;
+
             g_mutex_unlock(&self->lock);
             break;
 
@@ -489,6 +579,7 @@ static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStat
             /* Cleanup llama context */
             g_mutex_lock(&self->lock);
             if (self->llama_ctx) {
+                GST_DEBUG_OBJECT(self, "Freeing llama context in state transition");
                 llama_simple_free(self->llama_ctx);
                 self->llama_ctx = NULL;
             }
@@ -532,7 +623,10 @@ static GstFlowReturn gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer
         return GST_FLOW_ERROR;
     }
 
-    self->generating = TRUE;
+    /* Initialize generation state */
+    self->generating            = TRUE;
+    self->generation_aborted    = FALSE;
+    self->generation_start_time = g_get_monotonic_time();
 
     /* Configure generation parameters */
     llama_simple_gen_params gen_params = { 0 };
@@ -553,16 +647,25 @@ static GstFlowReturn gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer
 
     result = llama_simple_prompt_stream(self->llama_ctx, prompt, &gen_params, token_callback, self);
 
-    if (result != LLAMA_SIMPLE_OK) {
+    /* Check if generation was aborted or failed */
+    const char * stop_reason = "completed";
+
+    if (self->generation_aborted) {
+        GST_WARNING_OBJECT(self, "Generation was aborted due to timeout");
+        stop_reason = "timeout";
+        ret         = GST_FLOW_ERROR;
+        GST_ELEMENT_ERROR(self, STREAM, FAILED, ("Generation timeout"), ("Exceeded %d second limit", self->generation_timeout));
+    } else if (result != LLAMA_SIMPLE_OK) {
         const char * error = llama_simple_get_error(self->llama_ctx);
         GST_ELEMENT_ERROR(self, STREAM, FAILED, ("Generation failed: %s", error), (NULL));
-        ret = GST_FLOW_ERROR;
+        stop_reason = "error";
+        ret         = GST_FLOW_ERROR;
     } else {
         GST_INFO_OBJECT(self, "Generation completed successfully");
-        /* Emit generation-complete signal */
-        /* Note: full_text and num_tokens not currently tracked, using placeholders */
-        g_signal_emit(self, gst_llama_signals[SIGNAL_GENERATION_COMPLETE], 0, "", gen_params.max_tokens, "completed");
     }
+
+    /* Emit generation-complete signal with appropriate stop reason */
+    g_signal_emit(self, gst_llama_signals[SIGNAL_GENERATION_COMPLETE], 0, "", gen_params.max_tokens, stop_reason);
 
     self->generating = FALSE;
     g_mutex_unlock(&self->lock);
@@ -611,6 +714,8 @@ static GstPad * gst_llama_request_new_pad(GstElement * element, GstPadTemplate *
     GstLlama * self = GST_LLAMA(element);
     GstPad *   pad  = NULL;
 
+    GST_DEBUG_OBJECT(self, "Request new pad: template=%s, name=%s", GST_PAD_TEMPLATE_NAME_TEMPLATE(templ), name ? name : "NULL");
+
     if (templ == gst_element_class_get_pad_template(GST_ELEMENT_GET_CLASS(element), "ctrl")) {
         g_mutex_lock(&self->lock);
 
@@ -625,9 +730,11 @@ static GstPad * gst_llama_request_new_pad(GstElement * element, GstPadTemplate *
         gst_element_add_pad(element, self->ctrlpad);
         pad = self->ctrlpad;
 
-        GST_INFO_OBJECT(self, "Control pad created");
+        GST_INFO_OBJECT(self, "Control pad created successfully");
 
         g_mutex_unlock(&self->lock);
+    } else {
+        GST_WARNING_OBJECT(self, "Unknown pad template requested");
     }
 
     return pad;
@@ -649,35 +756,70 @@ static void gst_llama_release_pad(GstElement * element, GstPad * pad) {
 
 /* Control message handler */
 static void gst_llama_handle_set_params(GstLlama * self, JsonObject * obj) {
+    gint params_updated = 0;
+
     if (json_object_has_member(obj, "temperature")) {
-        self->temperature = json_object_get_double_member(obj, "temperature");
-        GST_INFO_OBJECT(self, "Updated temperature: %.2f", self->temperature);
+        gfloat new_temp = json_object_get_double_member(obj, "temperature");
+        if (new_temp >= 0.0 && new_temp <= 2.0) {
+            self->temperature = new_temp;
+            GST_INFO_OBJECT(self, "Updated temperature: %.2f", self->temperature);
+            params_updated++;
+        } else {
+            GST_WARNING_OBJECT(self, "Invalid temperature value: %.2f (must be 0.0-2.0)", new_temp);
+        }
     }
 
     if (json_object_has_member(obj, "top_p")) {
-        self->top_p = json_object_get_double_member(obj, "top_p");
-        GST_INFO_OBJECT(self, "Updated top_p: %.2f", self->top_p);
+        gfloat new_top_p = json_object_get_double_member(obj, "top_p");
+        if (new_top_p >= 0.0 && new_top_p <= 1.0) {
+            self->top_p = new_top_p;
+            GST_INFO_OBJECT(self, "Updated top_p: %.2f", self->top_p);
+            params_updated++;
+        } else {
+            GST_WARNING_OBJECT(self, "Invalid top_p value: %.2f (must be 0.0-1.0)", new_top_p);
+        }
     }
 
     if (json_object_has_member(obj, "top_k")) {
-        self->top_k = json_object_get_int_member(obj, "top_k");
-        GST_INFO_OBJECT(self, "Updated top_k: %d", self->top_k);
+        gint new_top_k = json_object_get_int_member(obj, "top_k");
+        if (new_top_k >= 0) {
+            self->top_k = new_top_k;
+            GST_INFO_OBJECT(self, "Updated top_k: %d", self->top_k);
+            params_updated++;
+        } else {
+            GST_WARNING_OBJECT(self, "Invalid top_k value: %d (must be >= 0)", new_top_k);
+        }
     }
 
     if (json_object_has_member(obj, "max_tokens")) {
-        self->max_tokens = json_object_get_int_member(obj, "max_tokens");
-        GST_INFO_OBJECT(self, "Updated max_tokens: %d", self->max_tokens);
+        gint new_max_tokens = json_object_get_int_member(obj, "max_tokens");
+        if (new_max_tokens > 0) {
+            self->max_tokens = new_max_tokens;
+            GST_INFO_OBJECT(self, "Updated max_tokens: %d", self->max_tokens);
+            params_updated++;
+        } else {
+            GST_WARNING_OBJECT(self, "Invalid max_tokens value: %d (must be > 0)", new_max_tokens);
+        }
     }
 
     if (json_object_has_member(obj, "repeat_penalty")) {
-        self->repeat_penalty = json_object_get_double_member(obj, "repeat_penalty");
-        GST_INFO_OBJECT(self, "Updated repeat_penalty: %.2f", self->repeat_penalty);
+        gfloat new_penalty = json_object_get_double_member(obj, "repeat_penalty");
+        if (new_penalty >= 0.0) {
+            self->repeat_penalty = new_penalty;
+            GST_INFO_OBJECT(self, "Updated repeat_penalty: %.2f", self->repeat_penalty);
+            params_updated++;
+        } else {
+            GST_WARNING_OBJECT(self, "Invalid repeat_penalty value: %.2f (must be >= 0.0)", new_penalty);
+        }
     }
 
     if (json_object_has_member(obj, "seed")) {
         self->seed = json_object_get_int_member(obj, "seed");
         GST_INFO_OBJECT(self, "Updated seed: %d", self->seed);
+        params_updated++;
     }
+
+    GST_DEBUG_OBJECT(self, "Control message processed: %d parameters updated", params_updated);
 }
 
 /* Control pad chain function */
