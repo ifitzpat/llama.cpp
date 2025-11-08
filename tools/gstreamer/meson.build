@@ -19,6 +19,8 @@ gst_dep = dependency('gstreamer-1.0', version : gst_req,
   fallback : ['gstreamer', 'gst_dep'])
 gstbase_dep = dependency('gstreamer-base-1.0', version : gst_req,
   fallback : ['gstreamer', 'gst_base_dep'])
+json_glib_dep = dependency('json-glib-1.0', version : '>= 1.0',
+  required : true)
 
 # llama_simple dependency
 llama_simple_lib = cc.find_library('llama_simple',
@@ -51,7 +53,7 @@ gstllama = library('gstllama',
   plugin_sources,
   c_args: plugin_c_args,
   include_directories : [include_directories('.'), include_directories('../ffi')],
-  dependencies : [gst_dep, gstbase_dep, llama_simple_lib],
+  dependencies : [gst_dep, gstbase_dep, json_glib_dep, llama_simple_lib],
   install : true,
   install_dir : plugins_install_dir,
 )

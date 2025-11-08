@@ -1,6 +1,6 @@
 # GStreamer llama.cpp Plugin
 
-**Phase:** 2 - Signal System
+**Phase:** 3 - Control Pad
 **Status:** ✅ Implementation Complete
 
 ## Overview
@@ -15,6 +15,7 @@
 - **Model loading** - Loads GGUF models at READY→PAUSED transition
 - **Thread-safe** - Proper locking for concurrent access
 - **GObject signals** - Real-time events for tokens, generation progress, and model lifecycle
+- **Control pad** - Runtime parameter adjustment via JSON control messages
 
 ## Architecture
 
@@ -158,6 +159,176 @@ make
 ./signal-example model.gguf input.txt output.txt
 ```
 
+## Control Pad
+
+The `llama` element provides a **request pad** named `ctrl` for runtime parameter adjustment via JSON control messages.
+
+### Control Pad Basics
+
+- **Name:** `ctrl`
+- **Type:** Request pad (created on demand)
+- **Direction:** Sink (input)
+- **Caps:** `application/x-llama-control`
+- **Purpose:** Send JSON control messages to adjust parameters during generation
+
+### Creating the Control Pad
+
+```c
+// Request the control pad
+GstPad *ctrl_pad = gst_element_request_pad_simple(llama, "ctrl");
+
+// Link a source element to send control messages
+gst_pad_link(source_pad, ctrl_pad);
+
+// When done, release the pad
+gst_element_release_request_pad(llama, ctrl_pad);
+gst_object_unref(ctrl_pad);
+```
+
+### Control Message Format
+
+Control messages are JSON objects sent as buffers to the control pad:
+
+```json
+{
+  "command": "set_params",
+  "temperature": 1.2,
+  "top_p": 0.95,
+  "top_k": 50,
+  "max_tokens": 200,
+  "repeat_penalty": 1.15,
+  "seed": 42
+}
+```
+
+### Available Commands
+
+#### set_params
+
+Update generation parameters at runtime.
+
+**Format:**
+```json
+{
+  "command": "set_params",
+  "temperature": <float>,      // Optional: sampling temperature (0.0-2.0)
+  "top_p": <float>,            // Optional: nucleus sampling (0.0-1.0)
+  "top_k": <int>,              // Optional: top-K sampling
+  "max_tokens": <int>,         // Optional: maximum tokens to generate
+  "repeat_penalty": <float>,   // Optional: repetition penalty
+  "seed": <int>                // Optional: random seed
+}
+```
+
+**Example:**
+```json
+{"command": "set_params", "temperature": 0.9, "max_tokens": 50}
+```
+
+### Using the Control Pad
+
+#### Method 1: appsrc Element
+
+```c
+// Create appsrc for sending control messages
+GstElement *ctrlsrc = gst_element_factory_make("appsrc", "ctrlsrc");
+g_object_set(ctrlsrc,
+             "caps", gst_caps_from_string("application/x-llama-control"),
+             NULL);
+
+// Request control pad and link
+GstPad *ctrl_pad = gst_element_request_pad_simple(llama, "ctrl");
+GstPad *src_pad = gst_element_get_static_pad(ctrlsrc, "src");
+gst_pad_link(src_pad, ctrl_pad);
+gst_object_unref(src_pad);
+
+// Send control message
+const char *msg = "{\"command\": \"set_params\", \"temperature\": 1.2}";
+GstBuffer *buffer = gst_buffer_new_allocate(NULL, strlen(msg), NULL);
+gst_buffer_fill(buffer, 0, msg, strlen(msg));
+
+GstFlowReturn ret;
+g_signal_emit_by_name(ctrlsrc, "push-buffer", buffer, &ret);
+gst_buffer_unref(buffer);
+```
+
+#### Method 2: Named Pipes (FIFO)
+
+```bash
+# Terminal 1: Create pipes and start pipeline
+mkfifo /tmp/prompt /tmp/control /tmp/output
+
+gst-launch-1.0 \
+  filesrc location=/tmp/prompt ! llama name=gen model=model.gguf ! filesink location=/tmp/output \
+  filesrc location=/tmp/control ! application/x-llama-control ! gen.ctrl
+
+# Terminal 2: Send prompt and control messages
+echo "Tell me a story" > /tmp/prompt
+
+# Increase creativity mid-generation
+echo '{"command": "set_params", "temperature": 1.5}' > /tmp/control
+
+# Read output
+cat /tmp/output
+```
+
+#### Method 3: File Source
+
+```bash
+# Create control message file
+echo '{"command": "set_params", "temperature": 0.8, "max_tokens": 100}' > ctrl.json
+
+# Pipeline with control
+gst-launch-1.0 \
+  filesrc location=prompt.txt ! llama name=gen model=model.gguf ! filesink location=output.txt \
+  filesrc location=ctrl.json ! application/x-llama-control ! gen.ctrl
+```
+
+### Control Pad Example
+
+See `examples/control-pad-example.c` for a complete example:
+
+```c
+// Request control pad
+GstPad *ctrl_pad = gst_element_request_pad_simple(llama, "ctrl");
+
+// Link appsrc
+gst_pad_link(ctrlsrc_pad, ctrl_pad);
+
+// Send control message
+const char *msg = "{\"command\": \"set_params\", \"temperature\": 1.2}";
+GstBuffer *buf = gst_buffer_new_allocate(NULL, strlen(msg), NULL);
+gst_buffer_fill(buf, 0, msg, strlen(msg));
+g_signal_emit_by_name(ctrlsrc, "push-buffer", buf, &ret);
+gst_buffer_unref(buf);
+
+// Release pad when done
+gst_element_release_request_pad(llama, ctrl_pad);
+gst_object_unref(ctrl_pad);
+```
+
+Build and run:
+```bash
+cd tools/gstreamer/examples
+make
+./control-pad-example model.gguf input.txt output.txt
+```
+
+### Use Cases
+
+1. **Adaptive Temperature** - Adjust creativity during generation
+2. **Token Limits** - Change max_tokens based on content
+3. **Parameter Tuning** - Find optimal settings interactively
+4. **Conditional Generation** - Different params for different prompt types
+5. **Interactive Control** - User-controlled parameter adjustment
+
+### Thread Safety
+
+- All parameter updates are thread-safe (protected by mutex)
+- Parameters take effect on the **next** generation
+- Current generation continues with existing parameters
+- No interruption of ongoing generation
+
 ## Build Instructions
 
 ### Prerequisites
@@ -167,6 +338,7 @@ make
 sudo apt-get install \
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \
+    libjson-glib-dev \
     meson \
     ninja-build
 
@@ -345,12 +517,12 @@ export GST_DEBUG=*:3,llama:5
 gst-launch-1.0 ... (your pipeline)
 ```
 
-## Limitations (Phase 2)
+## Limitations (Phase 3)
 
 - **Single model:** Only one model at a time
-- **No control pad:** Phase 3 will add control pad for parameter adjustment
 - **Basic text I/O:** Advanced features (chat templates, etc.) in later phases
 - **Limited statistics:** generation-complete signal currently uses placeholders for full_text
+- **Control commands:** Currently only `set_params` supported (logit bias requires C API extensions)
 
 ## Files
 
@@ -367,6 +539,7 @@ tools/gstreamer/
 ├── test-pipeline.sh               # Pipeline examples
 ├── examples/
 │   ├── signal-example.c           # Signal usage example
+│   ├── control-pad-example.c      # Control pad example
 │   └── Makefile                   # Example build configuration
 └── tests/
     ├── test_plugin.c              # Plugin registration test
@@ -375,14 +548,10 @@ tools/gstreamer/
 
 ## Next Phases
 
-**Phase 3:** Control Pad
-- Dedicated control pad for steering
-- Runtime logit bias adjustment
-- Stop/resume control
-
-**Phase 4:** Advanced Features
+**Phase 4:** Advanced Features (Future)
 - Chat template support
 - Multi-turn conversations
+- Logit bias support (requires C API extension)
 - Adaptive steering
 
 ## License
@@ -396,5 +565,5 @@ See main llama.cpp [CONTRIBUTING.md](../../CONTRIBUTING.md)
 ---
 
 **Last Updated:** 2025-11-08
-**Phase:** 2 - Signal System
+**Phase:** 3 - Control Pad
 **Status:** ✅ Complete

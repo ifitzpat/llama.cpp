@@ -8,6 +8,7 @@
 
 #include "gstllama.h"
 
+#include <json-glib/json-glib.h>
 #include <string.h>
 
 GST_DEBUG_CATEGORY_STATIC(gst_llama_debug);
@@ -19,6 +20,9 @@ static GstStaticPadTemplate sink_template =
 
 static GstStaticPadTemplate src_template =
     GST_STATIC_PAD_TEMPLATE("src", GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS("text/plain, charset=utf-8"));
+
+static GstStaticPadTemplate ctrl_template =
+    GST_STATIC_PAD_TEMPLATE("ctrl", GST_PAD_SINK, GST_PAD_REQUEST, GST_STATIC_CAPS("application/x-llama-control"));
 
 /* Properties */
 enum {
@@ -66,12 +70,15 @@ static guint gst_llama_signals[LAST_SIGNAL] = { 0 };
 G_DEFINE_TYPE(GstLlama, gst_llama, GST_TYPE_ELEMENT);
 
 /* Forward declarations */
-static void gst_llama_set_property(GObject * object, guint prop_id, const GValue * value, GParamSpec * pspec);
-static void gst_llama_get_property(GObject * object, guint prop_id, GValue * value, GParamSpec * pspec);
-static void gst_llama_finalize(GObject * object);
+static void                 gst_llama_set_property(GObject * object, guint prop_id, const GValue * value, GParamSpec * pspec);
+static void                 gst_llama_get_property(GObject * object, guint prop_id, GValue * value, GParamSpec * pspec);
+static void                 gst_llama_finalize(GObject * object);
 static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStateChange transition);
 static GstFlowReturn        gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer * buf);
 static gboolean             gst_llama_sink_event(GstPad * pad, GstObject * parent, GstEvent * event);
+static GstPad *             gst_llama_request_new_pad(GstElement * element, GstPadTemplate * templ, const gchar * name, const GstCaps * caps);
+static void                 gst_llama_release_pad(GstElement * element, GstPad * pad);
+static GstFlowReturn        gst_llama_ctrl_chain(GstPad * pad, GstObject * parent, GstBuffer * buf);
 
 /* Token callback for streaming */
 static gboolean token_callback(void *       user_data,
@@ -122,7 +129,9 @@ static void gst_llama_class_init(GstLlamaClass * klass) {
     gobject_class->get_property = gst_llama_get_property;
     gobject_class->finalize     = gst_llama_finalize;
 
-    element_class->change_state = gst_llama_change_state;
+    element_class->change_state     = gst_llama_change_state;
+    element_class->request_new_pad  = gst_llama_request_new_pad;
+    element_class->release_pad      = gst_llama_release_pad;
 
     /* Install properties */
     g_object_class_install_property(gobject_class, PROP_MODEL_PATH,
@@ -245,6 +254,7 @@ static void gst_llama_class_init(GstLlamaClass * klass) {
     /* Add pad templates */
     gst_element_class_add_static_pad_template(element_class, &sink_template);
     gst_element_class_add_static_pad_template(element_class, &src_template);
+    gst_element_class_add_static_pad_template(element_class, &ctrl_template);
 
     /* Set element metadata */
     gst_element_class_set_static_metadata(element_class, "LLaMA Text Generator", "Filter/Text/AI",
@@ -263,6 +273,9 @@ static void gst_llama_init(GstLlama * self) {
 
     self->srcpad = gst_pad_new_from_static_template(&src_template, "src");
     gst_element_add_pad(GST_ELEMENT(self), self->srcpad);
+
+    /* Control pad will be created on request */
+    self->ctrlpad = NULL;
 
     /* Initialize properties to defaults */
     self->model_path     = NULL;
@@ -589,6 +602,135 @@ static gboolean gst_llama_sink_event(GstPad * pad, GstObject * parent, GstEvent 
             ret = gst_pad_event_default(pad, parent, event);
             break;
     }
+
+    return ret;
+}
+
+/* Control pad request/release */
+static GstPad * gst_llama_request_new_pad(GstElement * element, GstPadTemplate * templ, const gchar * name, const GstCaps * caps) {
+    GstLlama * self = GST_LLAMA(element);
+    GstPad *   pad  = NULL;
+
+    if (templ == gst_element_class_get_pad_template(GST_ELEMENT_GET_CLASS(element), "ctrl")) {
+        g_mutex_lock(&self->lock);
+
+        if (self->ctrlpad) {
+            GST_WARNING_OBJECT(self, "Control pad already exists");
+            g_mutex_unlock(&self->lock);
+            return NULL;
+        }
+
+        self->ctrlpad = gst_pad_new_from_static_template(&ctrl_template, "ctrl");
+        gst_pad_set_chain_function(self->ctrlpad, GST_DEBUG_FUNCPTR(gst_llama_ctrl_chain));
+        gst_element_add_pad(element, self->ctrlpad);
+        pad = self->ctrlpad;
+
+        GST_INFO_OBJECT(self, "Control pad created");
+
+        g_mutex_unlock(&self->lock);
+    }
+
+    return pad;
+}
+
+static void gst_llama_release_pad(GstElement * element, GstPad * pad) {
+    GstLlama * self = GST_LLAMA(element);
+
+    g_mutex_lock(&self->lock);
+
+    if (pad == self->ctrlpad) {
+        gst_element_remove_pad(element, pad);
+        self->ctrlpad = NULL;
+        GST_INFO_OBJECT(self, "Control pad released");
+    }
+
+    g_mutex_unlock(&self->lock);
+}
+
+/* Control message handler */
+static void gst_llama_handle_set_params(GstLlama * self, JsonObject * obj) {
+    if (json_object_has_member(obj, "temperature")) {
+        self->temperature = json_object_get_double_member(obj, "temperature");
+        GST_INFO_OBJECT(self, "Updated temperature: %.2f", self->temperature);
+    }
+
+    if (json_object_has_member(obj, "top_p")) {
+        self->top_p = json_object_get_double_member(obj, "top_p");
+        GST_INFO_OBJECT(self, "Updated top_p: %.2f", self->top_p);
+    }
+
+    if (json_object_has_member(obj, "top_k")) {
+        self->top_k = json_object_get_int_member(obj, "top_k");
+        GST_INFO_OBJECT(self, "Updated top_k: %d", self->top_k);
+    }
+
+    if (json_object_has_member(obj, "max_tokens")) {
+        self->max_tokens = json_object_get_int_member(obj, "max_tokens");
+        GST_INFO_OBJECT(self, "Updated max_tokens: %d", self->max_tokens);
+    }
+
+    if (json_object_has_member(obj, "repeat_penalty")) {
+        self->repeat_penalty = json_object_get_double_member(obj, "repeat_penalty");
+        GST_INFO_OBJECT(self, "Updated repeat_penalty: %.2f", self->repeat_penalty);
+    }
+
+    if (json_object_has_member(obj, "seed")) {
+        self->seed = json_object_get_int_member(obj, "seed");
+        GST_INFO_OBJECT(self, "Updated seed: %d", self->seed);
+    }
+}
+
+/* Control pad chain function */
+static GstFlowReturn gst_llama_ctrl_chain(GstPad * pad, GstObject * parent, GstBuffer * buf) {
+    GstLlama *    self = GST_LLAMA(parent);
+    GstMapInfo    map;
+    JsonParser *  parser = NULL;
+    GError *      error  = NULL;
+    GstFlowReturn ret    = GST_FLOW_OK;
+
+    if (!gst_buffer_map(buf, &map, GST_MAP_READ)) {
+        GST_ERROR_OBJECT(self, "Failed to map control buffer");
+        gst_buffer_unref(buf);
+        return GST_FLOW_ERROR;
+    }
+
+    /* Parse JSON control message */
+    parser = json_parser_new();
+
+    if (!json_parser_load_from_data(parser, (const gchar *) map.data, map.size, &error)) {
+        GST_ERROR_OBJECT(self, "Failed to parse control JSON: %s", error->message);
+        g_error_free(error);
+        ret = GST_FLOW_ERROR;
+        goto cleanup;
+    }
+
+    JsonNode *  root = json_parser_get_root(parser);
+    JsonObject * obj  = json_node_get_object(root);
+
+    if (!json_object_has_member(obj, "command")) {
+        GST_ERROR_OBJECT(self, "Control message missing 'command' field");
+        ret = GST_FLOW_ERROR;
+        goto cleanup;
+    }
+
+    const gchar * command = json_object_get_string_member(obj, "command");
+
+    g_mutex_lock(&self->lock);
+
+    if (g_str_equal(command, "set_params")) {
+        gst_llama_handle_set_params(self, obj);
+    } else {
+        GST_WARNING_OBJECT(self, "Unknown control command: %s", command);
+    }
+
+    g_mutex_unlock(&self->lock);
+
+cleanup:
+    if (parser) {
+        g_object_unref(parser);
+    }
+    gst_buffer_unmap(buf, &map);
+    gst_buffer_unref(buf);
 
     return ret;
 }

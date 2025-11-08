@@ -30,6 +30,7 @@ struct _GstLlama {
     /* Pads */
     GstPad * sinkpad;
     GstPad * srcpad;
+    GstPad * ctrlpad; /* Control pad for runtime parameter adjustment */
 
     /* Properties */
     gchar *  model_path;
