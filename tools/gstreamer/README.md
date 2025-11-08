@@ -585,11 +585,15 @@ The llama element supports JSON chat message format for multi-turn conversations
 - `messages` (required): Array of message objects with `role` and `content`
   - `role`: "system", "user", or "assistant"
   - `content`: Message text
-- `temperature` (optional): Override element's temperature property
+  - System prompts: Use role "system" (typically first message)
+  - Conversation history: Include all previous user/assistant exchanges
+- `temperature` (optional): Override element's temperature property (0.0-2.0)
 - `max_tokens` (optional): Override element's max-tokens property
-- `top_p` (optional): Override element's top-p property
+- `top_p` (optional): Override element's top-p property (0.0-1.0)
 - `top_k` (optional): Override element's top-k property
 - `repeat_penalty` (optional): Override element's repeat-penalty property
+
+**Note:** The `seed` parameter is currently NOT supported in per-request parameters. Use the element's `seed` property instead for consistent random generation.
 
 **Pipeline Example:**
 
