@@ -1,11 +1,11 @@
 ---
 Language:        Cpp
 AlignAfterOpenBracket: Align
-# AlignArrayOfStructures: Left  # Requires clang-format 13+
-AlignConsecutiveAssignments: true  # AcrossComments requires clang-format 14+
-AlignConsecutiveBitFields: true  # AcrossComments requires clang-format 14+
-AlignConsecutiveDeclarations: true  # AcrossComments requires clang-format 14+
-AlignConsecutiveMacros: true  # AcrossComments requires clang-format 13+
+AlignArrayOfStructures: Left
+AlignConsecutiveAssignments: AcrossComments
+AlignConsecutiveBitFields: AcrossComments
+AlignConsecutiveDeclarations: AcrossComments
+AlignConsecutiveMacros: AcrossComments
 # AlignConsecutiveShortCaseStatements: AcrossComments
 AlignEscapedNewlines: Left # LeftWithLastLine
 AlignOperands:   Align
@@ -29,7 +29,7 @@ AttributeMacros:
   - __launch_bounds__
 BinPackArguments: true
 BinPackParameters: false # OnePerLine
-# BitFieldColonSpacing: Both  # Requires clang-format 12+
+BitFieldColonSpacing: Both
 BreakBeforeBraces: Custom # Attach
 BraceWrapping:
   AfterCaseLabel:  true
@@ -51,9 +51,9 @@ BraceWrapping:
   SplitEmptyRecord: false
   SplitEmptyNamespace: false
 # BreakAdjacentStringLiterals: true
-# BreakAfterAttributes: Never  # Requires clang-format 16+
+BreakAfterAttributes: Never
 BreakBeforeBinaryOperators: None
-# BreakBeforeInlineASMColon: OnlyMultiline  # Requires clang-format 11+
+BreakBeforeInlineASMColon: OnlyMultiline
 BreakBeforeTernaryOperators: false
 # BreakBinaryOperations: Never
 BreakConstructorInitializers: AfterColon
@@ -97,12 +97,12 @@ IndentGotoLabels: false
 IndentPPDirectives: AfterHash
 IndentWidth:     4
 IndentWrappedFunctionNames: false
-# InsertBraces:    true  # Requires clang-format 15+
-# InsertNewlineAtEOF: true  # Requires clang-format 16+
+InsertBraces:    true # NOTE: may lead to incorrect formatting
+InsertNewlineAtEOF: true
 JavaScriptQuotes: Leave
 JavaScriptWrapImports: true
 KeepEmptyLinesAtTheStartOfBlocks: false
-# LambdaBodyIndentation: Signature  # Requires clang-format 13+
+LambdaBodyIndentation: Signature
 LineEnding: LF
 MacroBlockBegin: ''
 MacroBlockEnd:   ''
@@ -113,7 +113,7 @@ ObjCBlockIndentWidth: 4
 ObjCSpaceAfterProperty: true
 ObjCSpaceBeforeProtocolList: true
 PPIndentWidth: -1
-# PackConstructorInitializers: CurrentLine  # Requires clang-format 14+
+PackConstructorInitializers: CurrentLine
 PenaltyBreakAssignment: 2
 PenaltyBreakBeforeFirstCallParameter: 1
 PenaltyBreakComment: 300
@@ -123,7 +123,7 @@ PenaltyBreakTemplateDeclaration: 10
 PenaltyExcessCharacter: 1000000
 PenaltyReturnTypeOnItsOwnLine: 200
 PointerAlignment: Middle
-# QualifierAlignment: Left  # Requires clang-format 14+
+QualifierAlignment: Left
 #QualifierOrder: ['static', 'inline', 'friend', 'constexpr', 'const', 'volatile', 'type', 'restrict']
 RawStringFormats:
   - Language:        Cpp
@@ -138,9 +138,9 @@ RawStringFormats:
     CanonicalDelimiter: ''
 ReferenceAlignment: Middle
 ReflowComments:  false # IndentOnly
-# SeparateDefinitionBlocks: Always  # Requires clang-format 14+
+SeparateDefinitionBlocks: Always
 SortIncludes:    CaseInsensitive
-SortUsingDeclarations: true  # LexicographicNumeric requires clang-format 16+
+SortUsingDeclarations: LexicographicNumeric
 SpaceAfterCStyleCast: true
 SpaceAfterLogicalNot: false
 SpaceAfterTemplateKeyword: true

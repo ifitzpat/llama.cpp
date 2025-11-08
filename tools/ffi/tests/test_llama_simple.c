@@ -135,7 +135,9 @@ int test_format_chat_without_model(void) {
     llama_simple_context * ctx = llama_simple_init(NULL);
     TEST_ASSERT(ctx != NULL, "Context should initialize");
 
-    llama_simple_chat_msg messages[] = { { .role = "user", .content = "Hello!" } };
+    llama_simple_chat_msg messages[] = {
+        { .role = "user", .content = "Hello!" }
+    };
 
     char * formatted = llama_simple_format_chat(ctx, messages, 1, true);
     TEST_ASSERT(formatted == NULL, "Formatting without model should return NULL");
@@ -257,7 +259,10 @@ int test_set_logit_bias_without_model(void) {
     llama_simple_context * ctx = llama_simple_init(NULL);
     TEST_ASSERT(ctx != NULL, "Context should initialize");
 
-    llama_simple_logit_bias biases[] = { { .token_str = "the", .bias = -1.0 }, { .token_str = "AI", .bias = 2.0 } };
+    llama_simple_logit_bias biases[] = {
+        { .token_str = "the", .bias = -1.0 },
+        { .token_str = "AI",  .bias = 2.0  }
+    };
 
     int result = llama_simple_set_logit_bias(ctx, biases, 2);
     TEST_ASSERT(result == LLAMA_SIMPLE_ERROR_NO_MODEL_LOADED,
@@ -272,7 +277,9 @@ int test_set_logit_bias_without_model(void) {
 int test_set_logit_bias_null_context(void) {
     TEST_START("Set logit bias with NULL context (should fail)");
 
-    llama_simple_logit_bias biases[] = { { .token_str = "test", .bias = 1.0 } };
+    llama_simple_logit_bias biases[] = {
+        { .token_str = "test", .bias = 1.0 }
+    };
 
     int result = llama_simple_set_logit_bias(NULL, biases, 1);
     TEST_ASSERT(result == LLAMA_SIMPLE_ERROR_INVALID_PARAMS,
@@ -466,9 +473,11 @@ int test_chat_template_with_model(void) {
     }
 
     // Format chat messages
-    llama_simple_chat_msg messages[] = { { .role = "user", .content = "Hello!" },
-                                         { .role = "assistant", .content = "Hi there! How can I help you?" },
-                                         { .role = "user", .content = "What's the weather like?" } };
+    llama_simple_chat_msg messages[] = {
+        { .role = "user",      .content = "Hello!"                        },
+        { .role = "assistant", .content = "Hi there! How can I help you?" },
+        { .role = "user",      .content = "What's the weather like?"      }
+    };
 
     char * formatted = llama_simple_format_chat(ctx, messages, 3, true);
 
