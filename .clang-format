@@ -2,10 +2,10 @@
 Language:        Cpp
 AlignAfterOpenBracket: Align
 # AlignArrayOfStructures: Left  # Requires clang-format 13+
-AlignConsecutiveAssignments: AcrossComments
-AlignConsecutiveBitFields: AcrossComments
-AlignConsecutiveDeclarations: AcrossComments
-AlignConsecutiveMacros: AcrossComments
+AlignConsecutiveAssignments: true  # AcrossComments requires clang-format 14+
+AlignConsecutiveBitFields: true  # AcrossComments requires clang-format 14+
+AlignConsecutiveDeclarations: true  # AcrossComments requires clang-format 14+
+AlignConsecutiveMacros: true  # AcrossComments requires clang-format 13+
 # AlignConsecutiveShortCaseStatements: AcrossComments
 AlignEscapedNewlines: Left # LeftWithLastLine
 AlignOperands:   Align
@@ -29,7 +29,7 @@ AttributeMacros:
   - __launch_bounds__
 BinPackArguments: true
 BinPackParameters: false # OnePerLine
-BitFieldColonSpacing: Both
+# BitFieldColonSpacing: Both  # Requires clang-format 12+
 BreakBeforeBraces: Custom # Attach
 BraceWrapping:
   AfterCaseLabel:  true
@@ -97,8 +97,8 @@ IndentGotoLabels: false
 IndentPPDirectives: AfterHash
 IndentWidth:     4
 IndentWrappedFunctionNames: false
-InsertBraces:    true # NOTE: may lead to incorrect formatting
-InsertNewlineAtEOF: true
+# InsertBraces:    true  # Requires clang-format 15+
+# InsertNewlineAtEOF: true  # Requires clang-format 16+
 JavaScriptQuotes: Leave
 JavaScriptWrapImports: true
 KeepEmptyLinesAtTheStartOfBlocks: false
@@ -113,7 +113,7 @@ ObjCBlockIndentWidth: 4
 ObjCSpaceAfterProperty: true
 ObjCSpaceBeforeProtocolList: true
 PPIndentWidth: -1
-PackConstructorInitializers: CurrentLine
+# PackConstructorInitializers: CurrentLine  # Requires clang-format 14+
 PenaltyBreakAssignment: 2
 PenaltyBreakBeforeFirstCallParameter: 1
 PenaltyBreakComment: 300
@@ -138,7 +138,7 @@ RawStringFormats:
     CanonicalDelimiter: ''
 ReferenceAlignment: Middle
 ReflowComments:  false # IndentOnly
-SeparateDefinitionBlocks: Always
+# SeparateDefinitionBlocks: Always  # Requires clang-format 14+
 SortIncludes:    CaseInsensitive
 SortUsingDeclarations: true  # LexicographicNumeric requires clang-format 16+
 SpaceAfterCStyleCast: true
