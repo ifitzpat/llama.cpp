@@ -28,13 +28,19 @@ link_directories(
 )
 
 # llama_simple library
-add_library(llama_simple SHARED
+add_library(llama_simple STATIC
     llama_simple.cpp
 )
 
 target_link_libraries(llama_simple
-    llama
     common
+    llama
+    -Wl,--start-group
+    ggml-base
+    ggml-cpu
+    ggml
+    -Wl,--end-group
+    gomp  # OpenMP for parallel computation
 )
 
 set_target_properties(llama_simple PROPERTIES
