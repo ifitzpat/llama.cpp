@@ -51,9 +51,18 @@ jobs:
             build-essential \
             cmake \
             libgomp1 \
-            libcurl4-openssl-dev \
-            clang-format \
-            clang-tidy
+            libcurl4-openssl-dev
+
+          # Install clang-format-18 (required for newer .clang-format syntax)
+          # Try versioned package first, fall back to generic
+          sudo apt-get install -y clang-format-18 clang-tidy-18 || \
+          sudo apt-get install -y clang-format clang-tidy
+
+          # Make clang-format-18 the default if it exists
+          if command -v clang-format-18 &> /dev/null; then
+            sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
+            sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-18 100
+          fi
 
       - name: Set up compiler
         run: |
@@ -231,7 +240,18 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-format clang-tidy cppcheck
+          sudo apt-get install -y cppcheck
+
+          # Install clang-format-18 (required for newer .clang-format syntax)
+          # Try versioned package first, fall back to generic
+          sudo apt-get install -y clang-format-18 clang-tidy-18 || \
+          sudo apt-get install -y clang-format clang-tidy
+
+          # Make clang-format-18 the default if it exists
+          if command -v clang-format-18 &> /dev/null; then
+            sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
+            sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-18 100
+          fi
 
       - name: Check formatting
         run: |
