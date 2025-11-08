@@ -15,8 +15,11 @@ GST_DEBUG_CATEGORY_STATIC(gst_llama_debug);
 #define GST_CAT_DEFAULT gst_llama_debug
 
 /* Pad templates */
-static GstStaticPadTemplate sink_template =
-    GST_STATIC_PAD_TEMPLATE("sink", GST_PAD_SINK, GST_PAD_ALWAYS, GST_STATIC_CAPS("text/plain, charset=utf-8"));
+static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE("sink",
+                                                                    GST_PAD_SINK,
+                                                                    GST_PAD_ALWAYS,
+                                                                    GST_STATIC_CAPS("text/plain, charset=utf-8; "
+                                                                                    "application/json"));
 
 static GstStaticPadTemplate src_template =
     GST_STATIC_PAD_TEMPLATE("src", GST_PAD_SRC, GST_PAD_ALWAYS, GST_STATIC_CAPS("text/plain, charset=utf-8"));
@@ -43,13 +46,13 @@ enum {
 };
 
 /* Default property values */
-#define DEFAULT_N_CTX          2048
-#define DEFAULT_N_GPU_LAYERS   0
-#define DEFAULT_N_THREADS      -1
-#define DEFAULT_TEMPERATURE    0.7f
-#define DEFAULT_TOP_P          0.9f
-#define DEFAULT_TOP_K          40
-#define DEFAULT_REPEAT_PENALTY 1.1f
+#define DEFAULT_N_CTX              2048
+#define DEFAULT_N_GPU_LAYERS       0
+#define DEFAULT_N_THREADS          -1
+#define DEFAULT_TEMPERATURE        0.7f
+#define DEFAULT_TOP_P              0.9f
+#define DEFAULT_TOP_K              40
+#define DEFAULT_REPEAT_PENALTY     1.1f
 #define DEFAULT_MAX_TOKENS         512
 #define DEFAULT_STREAM_TOKENS      TRUE
 #define DEFAULT_SEED               -1
@@ -72,15 +75,159 @@ static guint gst_llama_signals[LAST_SIGNAL] = { 0 };
 G_DEFINE_TYPE(GstLlama, gst_llama, GST_TYPE_ELEMENT);
 
 /* Forward declarations */
-static void                 gst_llama_set_property(GObject * object, guint prop_id, const GValue * value, GParamSpec * pspec);
-static void                 gst_llama_get_property(GObject * object, guint prop_id, GValue * value, GParamSpec * pspec);
-static void                 gst_llama_finalize(GObject * object);
+static void gst_llama_set_property(GObject * object, guint prop_id, const GValue * value, GParamSpec * pspec);
+static void gst_llama_get_property(GObject * object, guint prop_id, GValue * value, GParamSpec * pspec);
+static void gst_llama_finalize(GObject * object);
 static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStateChange transition);
 static GstFlowReturn        gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer * buf);
 static gboolean             gst_llama_sink_event(GstPad * pad, GstObject * parent, GstEvent * event);
-static GstPad *             gst_llama_request_new_pad(GstElement * element, GstPadTemplate * templ, const gchar * name, const GstCaps * caps);
+static GstPad *             gst_llama_request_new_pad(GstElement *     element,
+                                                      GstPadTemplate * templ,
+                                                      const gchar *    name,
+                                                      const GstCaps *  caps);
 static void                 gst_llama_release_pad(GstElement * element, GstPad * pad);
 static GstFlowReturn        gst_llama_ctrl_chain(GstPad * pad, GstObject * parent, GstBuffer * buf);
+
+/* Helper function to parse JSON chat messages and parameters
+ * Returns formatted prompt (caller must free) or NULL on error
+ * Optionally extracts per-request generation parameters
+ */
+static gchar * parse_json_chat_request(GstLlama * self, const gchar * json_str, llama_simple_gen_params * out_params) {
+    GError *     error      = NULL;
+    JsonParser * parser     = NULL;
+    JsonNode *   root       = NULL;
+    JsonObject * obj        = NULL;
+    JsonArray *  messages   = NULL;
+    gchar *      formatted  = NULL;
+    gboolean     has_params = FALSE;
+
+    /* Parse JSON */
+    parser = json_parser_new();
+    if (!json_parser_load_from_data(parser, json_str, -1, &error)) {
+        GST_WARNING_OBJECT(self, "Failed to parse JSON: %s", error->message);
+        g_error_free(error);
+        g_object_unref(parser);
+        return NULL;
+    }
+
+    root = json_parser_get_root(parser);
+    if (!JSON_NODE_HOLDS_OBJECT(root)) {
+        GST_WARNING_OBJECT(self, "JSON root is not an object");
+        g_object_unref(parser);
+        return NULL;
+    }
+
+    obj = json_node_get_object(root);
+
+    /* Extract messages array (required) */
+    if (!json_object_has_member(obj, "messages")) {
+        GST_WARNING_OBJECT(self, "JSON missing 'messages' field");
+        g_object_unref(parser);
+        return NULL;
+    }
+
+    messages = json_object_get_array_member(obj, "messages");
+    if (!messages) {
+        GST_WARNING_OBJECT(self, "Failed to get messages array");
+        g_object_unref(parser);
+        return NULL;
+    }
+
+    guint num_messages = json_array_get_length(messages);
+    if (num_messages == 0) {
+        GST_WARNING_OBJECT(self, "Empty messages array");
+        g_object_unref(parser);
+        return NULL;
+    }
+
+    /* Build llama_simple_chat_msg array */
+    llama_simple_chat_msg * chat_msgs = g_new0(llama_simple_chat_msg, num_messages);
+
+    for (guint i = 0; i < num_messages; i++) {
+        JsonObject * msg_obj = json_array_get_object_element(messages, i);
+        if (!msg_obj) {
+            GST_WARNING_OBJECT(self, "Message %u is not an object", i);
+            g_free(chat_msgs);
+            g_object_unref(parser);
+            return NULL;
+        }
+
+        /* Extract role and content */
+        if (!json_object_has_member(msg_obj, "role") || !json_object_has_member(msg_obj, "content")) {
+            GST_WARNING_OBJECT(self, "Message %u missing 'role' or 'content'", i);
+            g_free(chat_msgs);
+            g_object_unref(parser);
+            return NULL;
+        }
+
+        chat_msgs[i].role    = json_object_get_string_member(msg_obj, "role");
+        chat_msgs[i].content = json_object_get_string_member(msg_obj, "content");
+
+        GST_DEBUG_OBJECT(self, "Message %u: role=%s, content=%s", i, chat_msgs[i].role, chat_msgs[i].content);
+    }
+
+    /* Format using chat template */
+    formatted = llama_simple_format_chat(self->llama_ctx, chat_msgs, num_messages, TRUE);
+
+    if (!formatted) {
+        const char * error_msg = llama_simple_get_error(self->llama_ctx);
+        GST_WARNING_OBJECT(self, "Failed to format chat: %s", error_msg ? error_msg : "unknown error");
+        g_free(chat_msgs);
+        g_object_unref(parser);
+        return NULL;
+    }
+
+    GST_DEBUG_OBJECT(self, "Formatted chat prompt: %s", formatted);
+
+    /* Extract optional per-request parameters */
+    if (out_params) {
+        if (json_object_has_member(obj, "temperature")) {
+            out_params->temperature = (float) json_object_get_double_member(obj, "temperature");
+            has_params              = TRUE;
+            GST_DEBUG_OBJECT(self, "Request temperature: %.2f", out_params->temperature);
+        }
+
+        if (json_object_has_member(obj, "top_p")) {
+            out_params->top_p = (float) json_object_get_double_member(obj, "top_p");
+            has_params        = TRUE;
+            GST_DEBUG_OBJECT(self, "Request top_p: %.2f", out_params->top_p);
+        }
+
+        if (json_object_has_member(obj, "top_k")) {
+            out_params->top_k = (int) json_object_get_int_member(obj, "top_k");
+            has_params        = TRUE;
+            GST_DEBUG_OBJECT(self, "Request top_k: %d", out_params->top_k);
+        }
+
+        if (json_object_has_member(obj, "max_tokens")) {
+            out_params->max_tokens = (int) json_object_get_int_member(obj, "max_tokens");
+            has_params             = TRUE;
+            GST_DEBUG_OBJECT(self, "Request max_tokens: %d", out_params->max_tokens);
+        }
+
+        if (json_object_has_member(obj, "repeat_penalty")) {
+            out_params->repeat_penalty = (float) json_object_get_double_member(obj, "repeat_penalty");
+            has_params                 = TRUE;
+            GST_DEBUG_OBJECT(self, "Request repeat_penalty: %.2f", out_params->repeat_penalty);
+        }
+
+        if (json_object_has_member(obj, "seed")) {
+            /* Note: llama_simple doesn't have per-request seed in gen_params,
+             * but we log it for future extension */
+            int seed = (int) json_object_get_int_member(obj, "seed");
+            GST_DEBUG_OBJECT(self, "Request seed: %d (currently unsupported in per-request params)", seed);
+        }
+
+        if (has_params) {
+            GST_INFO_OBJECT(self, "Using per-request parameters from JSON");
+        }
+    }
+
+    g_free(chat_msgs);
+    g_object_unref(parser);
+
+    return formatted;
+}
 
 /* Token callback for streaming */
 static gboolean token_callback(void *       user_data,
@@ -152,9 +299,9 @@ static void gst_llama_class_init(GstLlamaClass * klass) {
     gobject_class->get_property = gst_llama_get_property;
     gobject_class->finalize     = gst_llama_finalize;
 
-    element_class->change_state     = gst_llama_change_state;
-    element_class->request_new_pad  = gst_llama_request_new_pad;
-    element_class->release_pad      = gst_llama_release_pad;
+    element_class->change_state    = gst_llama_change_state;
+    element_class->request_new_pad = gst_llama_request_new_pad;
+    element_class->release_pad     = gst_llama_release_pad;
 
     /* Install properties */
     g_object_class_install_property(gobject_class, PROP_MODEL_PATH,
@@ -226,11 +373,11 @@ static void gst_llama_class_init(GstLlamaClass * klass) {
      * Emitted when a token is generated during text generation.
      */
     gst_llama_signals[SIGNAL_TOKEN_GENERATED] =
-        g_signal_new("token-generated", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE, 4,
-                     G_TYPE_STRING,  /* token */
-                     G_TYPE_INT,     /* token_id */
-                     G_TYPE_FLOAT,   /* probability */
-                     G_TYPE_INT);    /* position */
+        g_signal_new("token-generated", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE,
+                     4, G_TYPE_STRING, /* token */
+                     G_TYPE_INT,       /* token_id */
+                     G_TYPE_FLOAT,     /* probability */
+                     G_TYPE_INT);      /* position */
 
     /**
      * GstLlama::generation-started:
@@ -254,10 +401,9 @@ static void gst_llama_class_init(GstLlamaClass * klass) {
      */
     gst_llama_signals[SIGNAL_GENERATION_COMPLETE] =
         g_signal_new("generation-complete", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
-                     G_TYPE_NONE, 3,
-                     G_TYPE_STRING,  /* full_text */
-                     G_TYPE_INT,     /* num_tokens */
-                     G_TYPE_STRING); /* stop_reason */
+                     G_TYPE_NONE, 3, G_TYPE_STRING, /* full_text */
+                     G_TYPE_INT,                    /* num_tokens */
+                     G_TYPE_STRING);                /* stop_reason */
 
     /**
      * GstLlama::model-loaded:
@@ -276,9 +422,8 @@ static void gst_llama_class_init(GstLlamaClass * klass) {
      *
      * Emitted when a model is unloaded.
      */
-    gst_llama_signals[SIGNAL_MODEL_UNLOADED] =
-        g_signal_new("model-unloaded", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE,
-                     0);
+    gst_llama_signals[SIGNAL_MODEL_UNLOADED] = g_signal_new("model-unloaded", G_TYPE_FROM_CLASS(klass),
+                                                            G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE, 0);
 
     /* Add pad templates */
     gst_element_class_add_static_pad_template(element_class, &sink_template);
@@ -307,14 +452,14 @@ static void gst_llama_init(GstLlama * self) {
     self->ctrlpad = NULL;
 
     /* Initialize properties to defaults */
-    self->model_path     = NULL;
-    self->n_ctx          = DEFAULT_N_CTX;
-    self->n_gpu_layers   = DEFAULT_N_GPU_LAYERS;
-    self->n_threads      = DEFAULT_N_THREADS;
-    self->temperature    = DEFAULT_TEMPERATURE;
-    self->top_p          = DEFAULT_TOP_P;
-    self->top_k          = DEFAULT_TOP_K;
-    self->repeat_penalty = DEFAULT_REPEAT_PENALTY;
+    self->model_path         = NULL;
+    self->n_ctx              = DEFAULT_N_CTX;
+    self->n_gpu_layers       = DEFAULT_N_GPU_LAYERS;
+    self->n_threads          = DEFAULT_N_THREADS;
+    self->temperature        = DEFAULT_TEMPERATURE;
+    self->top_p              = DEFAULT_TOP_P;
+    self->top_k              = DEFAULT_TOP_K;
+    self->repeat_penalty     = DEFAULT_REPEAT_PENALTY;
     self->max_tokens         = DEFAULT_MAX_TOKENS;
     self->stream_tokens      = DEFAULT_STREAM_TOKENS;
     self->seed               = DEFAULT_SEED;
@@ -482,7 +627,8 @@ static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStat
 
                 if (!g_file_test(self->model_path, G_FILE_TEST_IS_REGULAR)) {
                     g_mutex_unlock(&self->lock);
-                    GST_ELEMENT_ERROR(self, RESOURCE, OPEN_READ, ("Model path is not a regular file: %s", self->model_path),
+                    GST_ELEMENT_ERROR(self, RESOURCE, OPEN_READ,
+                                      ("Model path is not a regular file: %s", self->model_path),
                                       ("Path may be a directory or special file"));
                     return GST_STATE_CHANGE_FAILURE;
                 }
@@ -524,8 +670,8 @@ static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStat
                 }
 
                 self->model_loaded = TRUE;
-                GST_INFO_OBJECT(self, "Model loaded successfully: %s (ctx=%d, gpu_layers=%d)", self->model_path, self->n_ctx,
-                                self->n_gpu_layers);
+                GST_INFO_OBJECT(self, "Model loaded successfully: %s (ctx=%d, gpu_layers=%d)", self->model_path,
+                                self->n_ctx, self->n_gpu_layers);
 
                 /* Emit model-loaded signal */
                 g_signal_emit(self, gst_llama_signals[SIGNAL_MODEL_LOADED], 0, self->model_path);
@@ -597,8 +743,11 @@ static GstStateChangeReturn gst_llama_change_state(GstElement * element, GstStat
 static GstFlowReturn gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer * buf) {
     GstLlama *    self = GST_LLAMA(parent);
     GstMapInfo    map;
-    GstFlowReturn ret    = GST_FLOW_OK;
-    gchar *       prompt = NULL;
+    GstFlowReturn ret         = GST_FLOW_OK;
+    gchar *       input_text  = NULL;
+    gchar *       prompt      = NULL;
+    gboolean      is_json     = FALSE;
+    gboolean      free_prompt = FALSE;
     int           result;
 
     if (!gst_buffer_map(buf, &map, GST_MAP_READ)) {
@@ -607,19 +756,19 @@ static GstFlowReturn gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer
         return GST_FLOW_ERROR;
     }
 
-    /* Extract prompt from buffer */
-    prompt = g_strndup((const gchar *) map.data, map.size);
+    /* Extract input from buffer */
+    input_text = g_strndup((const gchar *) map.data, map.size);
     gst_buffer_unmap(buf, &map);
     gst_buffer_unref(buf);
 
-    GST_DEBUG_OBJECT(self, "Received prompt: %s", prompt);
+    GST_DEBUG_OBJECT(self, "Received input: %s", input_text);
 
     g_mutex_lock(&self->lock);
 
     if (!self->model_loaded) {
         g_mutex_unlock(&self->lock);
         GST_ELEMENT_ERROR(self, CORE, FAILED, ("No model loaded"), (NULL));
-        g_free(prompt);
+        g_free(input_text);
         return GST_FLOW_ERROR;
     }
 
@@ -628,7 +777,7 @@ static GstFlowReturn gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer
     self->generation_aborted    = FALSE;
     self->generation_start_time = g_get_monotonic_time();
 
-    /* Configure generation parameters */
+    /* Configure generation parameters (start with element defaults) */
     llama_simple_gen_params gen_params = { 0 };
     gen_params.max_tokens              = self->max_tokens;
     gen_params.temperature             = self->temperature;
@@ -637,6 +786,29 @@ static GstFlowReturn gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer
     gen_params.repeat_penalty          = self->repeat_penalty;
     gen_params.stop_words              = NULL;
     gen_params.num_stop_words          = 0;
+
+    /* Detect JSON input (simple heuristic: starts with '{') */
+    if (input_text && input_text[0] == '{') {
+        is_json = TRUE;
+        GST_INFO_OBJECT(self, "Detected JSON input, parsing chat messages");
+
+        /* Parse JSON and extract chat messages + per-request parameters */
+        prompt = parse_json_chat_request(self, input_text, &gen_params);
+
+        if (!prompt) {
+            g_mutex_unlock(&self->lock);
+            GST_ELEMENT_ERROR(self, STREAM, FORMAT, ("Failed to parse JSON chat request"), (NULL));
+            g_free(input_text);
+            return GST_FLOW_ERROR;
+        }
+
+        free_prompt = TRUE;
+        GST_INFO_OBJECT(self, "Using formatted chat prompt from JSON");
+    } else {
+        /* Plain text input - use as-is */
+        prompt = input_text;
+        GST_INFO_OBJECT(self, "Using plain text input");
+    }
 
     /* Generate text */
     GST_INFO_OBJECT(self, "Starting generation (max_tokens=%d, temp=%.2f)", gen_params.max_tokens,
@@ -654,7 +826,8 @@ static GstFlowReturn gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer
         GST_WARNING_OBJECT(self, "Generation was aborted due to timeout");
         stop_reason = "timeout";
         ret         = GST_FLOW_ERROR;
-        GST_ELEMENT_ERROR(self, STREAM, FAILED, ("Generation timeout"), ("Exceeded %d second limit", self->generation_timeout));
+        GST_ELEMENT_ERROR(self, STREAM, FAILED, ("Generation timeout"),
+                          ("Exceeded %d second limit", self->generation_timeout));
     } else if (result != LLAMA_SIMPLE_OK) {
         const char * error = llama_simple_get_error(self->llama_ctx);
         GST_ELEMENT_ERROR(self, STREAM, FAILED, ("Generation failed: %s", error), (NULL));
@@ -670,7 +843,15 @@ static GstFlowReturn gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer
     self->generating = FALSE;
     g_mutex_unlock(&self->lock);
 
-    g_free(prompt);
+    /* Free allocated memory */
+    if (free_prompt) {
+        /* JSON path: free both the formatted prompt and input text */
+        llama_simple_free_string(prompt);
+        g_free(input_text);
+    } else {
+        /* Plain text path: prompt == input_text, only free once */
+        g_free(input_text);
+    }
 
     /* Send EOS downstream if not streaming tokens */
     if (!self->stream_tokens && ret == GST_FLOW_OK) {
@@ -710,11 +891,15 @@ static gboolean gst_llama_sink_event(GstPad * pad, GstObject * parent, GstEvent 
 }
 
 /* Control pad request/release */
-static GstPad * gst_llama_request_new_pad(GstElement * element, GstPadTemplate * templ, const gchar * name, const GstCaps * caps) {
+static GstPad * gst_llama_request_new_pad(GstElement *     element,
+                                          GstPadTemplate * templ,
+                                          const gchar *    name,
+                                          const GstCaps *  caps) {
     GstLlama * self = GST_LLAMA(element);
     GstPad *   pad  = NULL;
 
-    GST_DEBUG_OBJECT(self, "Request new pad: template=%s, name=%s", GST_PAD_TEMPLATE_NAME_TEMPLATE(templ), name ? name : "NULL");
+    GST_DEBUG_OBJECT(self, "Request new pad: template=%s, name=%s", GST_PAD_TEMPLATE_NAME_TEMPLATE(templ),
+                     name ? name : "NULL");
 
     if (templ == gst_element_class_get_pad_template(GST_ELEMENT_GET_CLASS(element), "ctrl")) {
         g_mutex_lock(&self->lock);
@@ -846,7 +1031,7 @@ static GstFlowReturn gst_llama_ctrl_chain(GstPad * pad, GstObject * parent, GstB
         goto cleanup;
     }
 
-    JsonNode *  root = json_parser_get_root(parser);
+    JsonNode *   root = json_parser_get_root(parser);
     JsonObject * obj  = json_node_get_object(root);
 
     if (!json_object_has_member(obj, "command")) {

@@ -1,6 +1,6 @@
 # GStreamer llama.cpp Plugin
 
-**Phase:** 4 - Error Handling & Production Features
+**Phase:** 5A - JSON Chat Messages
 **Status:** ✅ Implementation Complete
 
 ## Overview
@@ -10,8 +10,10 @@
 ## Features
 
 - **Text input/output pads** - Accepts text prompts, outputs generated text
+- **JSON chat messages** - OpenAI-compatible chat format with automatic template formatting
 - **Streaming support** - Can stream individual tokens or complete responses
 - **Configurable properties** - Full control over generation parameters
+- **Per-request parameters** - Override settings via JSON for each request
 - **Model loading** - Loads GGUF models at READY→PAUSED transition
 - **Thread-safe** - Proper locking for concurrent access
 - **GObject signals** - Real-time events for tokens, generation progress, and model lifecycle
@@ -450,14 +452,145 @@ msg = bus.timed_pop_filtered(
 pipeline.set_state(Gst.State.NULL)
 ```
 
+### 6. JSON Chat Messages (OpenAI-Compatible)
+
+The llama element supports JSON chat message format for multi-turn conversations. This uses the model's built-in chat template (Jinja) and allows per-request parameter overrides.
+
+**JSON Format:**
+
+```json
+{
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "What is the capital of France?"}
+  ],
+  "temperature": 0.7,
+  "max_tokens": 100,
+  "top_p": 0.95,
+  "top_k": 40,
+  "repeat_penalty": 1.1
+}
+```
+
+**Fields:**
+
+- `messages` (required): Array of message objects with `role` and `content`
+  - `role`: "system", "user", or "assistant"
+  - `content`: Message text
+- `temperature` (optional): Override element's temperature property
+- `max_tokens` (optional): Override element's max-tokens property
+- `top_p` (optional): Override element's top-p property
+- `top_k` (optional): Override element's top-k property
+- `repeat_penalty` (optional): Override element's repeat-penalty property
+
+**Pipeline Example:**
+
+```bash
+# Create JSON file with chat messages
+cat > chat.json << 'EOF'
+{
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Explain quantum computing in simple terms."}
+  ],
+  "temperature": 0.8,
+  "max_tokens": 150
+}
+EOF
+
+# Send JSON to llama element
+gst-launch-1.0 \
+    filesrc location=chat.json ! \
+    application/json ! \
+    llama model=/path/to/model.gguf ! \
+    filesink location=response.txt
+```
+
+**Python Example:**
+
+```python
+import gi
+import json
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst
+
+Gst.init(None)
+
+# Create JSON chat request
+chat_request = {
+    "messages": [
+        {"role": "system", "content": "You are a helpful coding assistant."},
+        {"role": "user", "content": "Write a Python function to reverse a string."}
+    ],
+    "temperature": 0.7,
+    "max_tokens": 200
+}
+
+json_data = json.dumps(chat_request)
+
+# Create pipeline
+pipeline = Gst.Pipeline.new("json-chat")
+appsrc = Gst.ElementFactory.make("appsrc", "source")
+llama = Gst.ElementFactory.make("llama", "generator")
+filesink = Gst.ElementFactory.make("filesink", "sink")
+
+# Configure elements
+caps = Gst.Caps.from_string("application/json")
+appsrc.set_property("caps", caps)
+llama.set_property("model", "/path/to/model.gguf")
+filesink.set_property("location", "response.txt")
+
+# Build pipeline
+pipeline.add(appsrc)
+pipeline.add(llama)
+pipeline.add(filesink)
+appsrc.link(llama)
+llama.link(filesink)
+
+# Push JSON data
+pipeline.set_state(Gst.State.PLAYING)
+buffer = Gst.Buffer.new_allocate(None, len(json_data), None)
+buffer.fill(0, json_data.encode())
+appsrc.emit("push-buffer", buffer)
+appsrc.emit("end-of-stream")
+
+# Wait for completion
+bus = pipeline.get_bus()
+msg = bus.timed_pop_filtered(
+    Gst.CLOCK_TIME_NONE,
+    Gst.MessageType.ERROR | Gst.MessageType.EOS
+)
+
+pipeline.set_state(Gst.State.NULL)
+```
+
+**How It Works:**
+
+1. Element detects JSON input (content starts with `{`)
+2. Parses JSON and extracts `messages` array
+3. Builds `llama_simple_chat_msg` structures
+4. Calls `llama_simple_format_chat()` to apply model's chat template
+5. Extracts per-request parameters (if provided)
+6. Uses formatted prompt for generation
+
+**Benefits:**
+
+- **Chat template support**: Automatically formats messages using the model's Jinja template
+- **Stateless**: Upstream component manages conversation history
+- **OpenAI-compatible**: Same JSON format as OpenAI Chat Completions API
+- **Flexible parameters**: Override generation settings per request
+- **Multi-turn conversations**: Natural handling of system/user/assistant messages
+
+**See also:** `examples/json-chat-example.c` for a complete C example
+
 ## Pad Capabilities
 
 ### Sink Pad
 
 - **Name:** `sink`
 - **Direction:** Sink (input)
-- **Caps:** `text/plain, charset=utf-8`
-- **Description:** Accepts text prompts for generation
+- **Caps:** `text/plain, charset=utf-8` or `application/json`
+- **Description:** Accepts plain text prompts or JSON chat messages for generation
 
 ### Source Pad
 
