@@ -219,6 +219,8 @@ jobs:
       - name: Run tests with model
         run: |
           cd tools/ffi/build
+          # Set model path for tests (relative to repo root)
+          export TEST_MODEL_PATH="${GITHUB_WORKSPACE}/models/test/gemma-3-270m-qat-Q4_0.gguf"
           ./test_llama_simple 2>&1 | tee test-output.log
           # Check that positive path tests passed
           if ! grep -q "ALL TESTS PASSED" test-output.log; then

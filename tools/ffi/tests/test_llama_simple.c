@@ -366,7 +366,15 @@ int test_use_after_free(void) {
 // Test 8: Positive Path - Actual Model Loading and Generation
 // =============================================================================
 
-#define TEST_MODEL_PATH "/home/user/llama.cpp/models/test/gemma-3-270m-qat-Q4_0.gguf"
+// Helper function to get model path from environment or use default
+static const char * get_test_model_path(void) {
+    const char * env_path = getenv("TEST_MODEL_PATH");
+    if (env_path != NULL) {
+        return env_path;
+    }
+    // Default path (works for both local dev and CI when run from repo root)
+    return "models/test/gemma-3-270m-qat-Q4_0.gguf";
+}
 
 int test_load_real_model(void) {
     TEST_START("Load real model (positive path)");
@@ -381,7 +389,7 @@ int test_load_real_model(void) {
     TEST_ASSERT(ctx != NULL, "Context should initialize");
 
     // Load the actual model
-    int result = llama_simple_load_model(ctx, TEST_MODEL_PATH, NULL);
+    int result = llama_simple_load_model(ctx, get_test_model_path(), NULL);
     if (result != LLAMA_SIMPLE_OK) {
         const char * error = llama_simple_get_error(ctx);
         printf("    Error loading model: %s\n", error ? error : "unknown");
@@ -417,7 +425,7 @@ int test_simple_generation(void) {
     TEST_ASSERT(ctx != NULL, "Context should initialize");
 
     // Load model
-    int result = llama_simple_load_model(ctx, TEST_MODEL_PATH, NULL);
+    int result = llama_simple_load_model(ctx, get_test_model_path(), NULL);
     if (result != LLAMA_SIMPLE_OK) {
         llama_simple_free(ctx);
         printf("    (Skipping - model not available)\n");
@@ -464,7 +472,7 @@ int test_chat_template_with_model(void) {
     TEST_ASSERT(ctx != NULL, "Context should initialize");
 
     // Load model
-    int result = llama_simple_load_model(ctx, TEST_MODEL_PATH, NULL);
+    int result = llama_simple_load_model(ctx, get_test_model_path(), NULL);
     if (result != LLAMA_SIMPLE_OK) {
         llama_simple_free(ctx);
         printf("    (Skipping - model not available)\n");
