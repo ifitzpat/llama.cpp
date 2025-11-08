@@ -49,6 +49,18 @@ enum {
 #define DEFAULT_STREAM_TOKENS  TRUE
 #define DEFAULT_SEED           -1
 
+/* Signals */
+enum {
+    SIGNAL_TOKEN_GENERATED,
+    SIGNAL_GENERATION_STARTED,
+    SIGNAL_GENERATION_COMPLETE,
+    SIGNAL_MODEL_LOADED,
+    SIGNAL_MODEL_UNLOADED,
+    LAST_SIGNAL
+};
+
+static guint gst_llama_signals[LAST_SIGNAL] = { 0 };
+
 /* GObject boilerplate */
 #define gst_llama_parent_class parent_class
 G_DEFINE_TYPE(GstLlama, gst_llama, GST_TYPE_ELEMENT);
@@ -87,6 +99,9 @@ static gboolean token_callback(void *       user_data,
     gst_buffer_fill(outbuf, 0, token_text, token_len);
 
     GST_LOG_OBJECT(self, "Pushing token: '%s' (id=%d, prob=%.4f, pos=%d)", token_text, token_id, probability, position);
+
+    /* Emit token-generated signal */
+    g_signal_emit(self, gst_llama_signals[SIGNAL_TOKEN_GENERATED], 0, token_text, token_id, probability, position);
 
     /* Push buffer downstream */
     ret = gst_pad_push(self->srcpad, outbuf);
@@ -160,6 +175,72 @@ static void gst_llama_class_init(GstLlamaClass * klass) {
         gobject_class, PROP_SEED,
         g_param_spec_int("seed", "Random Seed", "Random seed (-1 for random)", -1, G_MAXINT32, DEFAULT_SEED,
                          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+    /* Register signals */
+    /**
+     * GstLlama::token-generated:
+     * @llama: the llama element
+     * @token: token text
+     * @token_id: token ID
+     * @probability: token probability (0.0-1.0)
+     * @position: position in generated sequence
+     *
+     * Emitted when a token is generated during text generation.
+     */
+    gst_llama_signals[SIGNAL_TOKEN_GENERATED] =
+        g_signal_new("token-generated", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE, 4,
+                     G_TYPE_STRING,  /* token */
+                     G_TYPE_INT,     /* token_id */
+                     G_TYPE_FLOAT,   /* probability */
+                     G_TYPE_INT);    /* position */
+
+    /**
+     * GstLlama::generation-started:
+     * @llama: the llama element
+     * @prompt: the input prompt
+     *
+     * Emitted when text generation starts.
+     */
+    gst_llama_signals[SIGNAL_GENERATION_STARTED] =
+        g_signal_new("generation-started", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
+                     G_TYPE_NONE, 1, G_TYPE_STRING); /* prompt */
+
+    /**
+     * GstLlama::generation-complete:
+     * @llama: the llama element
+     * @full_text: complete generated text
+     * @num_tokens: number of tokens generated
+     * @stop_reason: reason for stopping (e.g., "eos", "max_tokens")
+     *
+     * Emitted when text generation completes.
+     */
+    gst_llama_signals[SIGNAL_GENERATION_COMPLETE] =
+        g_signal_new("generation-complete", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
+                     G_TYPE_NONE, 3,
+                     G_TYPE_STRING,  /* full_text */
+                     G_TYPE_INT,     /* num_tokens */
+                     G_TYPE_STRING); /* stop_reason */
+
+    /**
+     * GstLlama::model-loaded:
+     * @llama: the llama element
+     * @model_path: path to the loaded model
+     *
+     * Emitted when a model is successfully loaded.
+     */
+    gst_llama_signals[SIGNAL_MODEL_LOADED] =
+        g_signal_new("model-loaded", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE, 1,
+                     G_TYPE_STRING); /* model_path */
+
+    /**
+     * GstLlama::model-unloaded:
+     * @llama: the llama element
+     *
+     * Emitted when a model is unloaded.
+     */
+    gst_llama_signals[SIGNAL_MODEL_UNLOADED] =
+        g_signal_new("model-unloaded", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE,
+                     0);
 
     /* Add pad templates */
     gst_element_class_add_static_pad_template(element_class, &sink_template);
@@ -448,6 +529,9 @@ static GstFlowReturn gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer
     GST_INFO_OBJECT(self, "Starting generation (max_tokens=%d, temp=%.2f)", gen_params.max_tokens,
                     gen_params.temperature);
 
+    /* Emit generation-started signal */
+    g_signal_emit(self, gst_llama_signals[SIGNAL_GENERATION_STARTED], 0, prompt);
+
     result = llama_simple_prompt_stream(self->llama_ctx, prompt, &gen_params, token_callback, self);
 
     if (result != LLAMA_SIMPLE_OK) {
@@ -456,6 +540,9 @@ static GstFlowReturn gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer
         ret = GST_FLOW_ERROR;
     } else {
         GST_INFO_OBJECT(self, "Generation completed successfully");
+        /* Emit generation-complete signal */
+        /* Note: full_text and num_tokens not currently tracked, using placeholders */
+        g_signal_emit(self, gst_llama_signals[SIGNAL_GENERATION_COMPLETE], 0, "", gen_params.max_tokens, "completed");
     }
 
     self->generating = FALSE;
