@@ -1,6 +1,6 @@
 # GStreamer llama.cpp Plugin
 
-**Phase:** 5A - JSON Chat Messages
+**Phase:** 5B - Dynamic Model Loading
 **Status:** ✅ Implementation Complete
 
 ## Overview
@@ -11,13 +11,16 @@
 
 - **Text input/output pads** - Accepts text prompts, outputs generated text
 - **JSON chat messages** - OpenAI-compatible chat format with automatic template formatting
+- **Dynamic model loading** - Load/unload models at runtime via control pad
+- **Asynchronous operations** - Non-blocking model loading with progress signals
+- **Buffer queuing** - Optional buffering during model transitions
 - **Streaming support** - Can stream individual tokens or complete responses
 - **Configurable properties** - Full control over generation parameters
 - **Per-request parameters** - Override settings via JSON for each request
-- **Model loading** - Loads GGUF models at READY→PAUSED transition
+- **State management** - Robust model state tracking (UNLOADED/LOADING/READY/ERROR)
 - **Thread-safe** - Proper locking for concurrent access
-- **GObject signals** - Real-time events for tokens, generation progress, and model lifecycle
-- **Control pad** - Runtime parameter adjustment via JSON control messages
+- **GObject signals** - Real-time events for tokens, generation, and model lifecycle
+- **Control pad** - Runtime parameter adjustment and model management via JSON
 - **Error handling** - Comprehensive error detection, timeout protection, and graceful recovery
 - **Production-ready** - Input validation, detailed error messages, robust state management
 
@@ -51,6 +54,8 @@
 | `stream-tokens` | boolean | TRUE | Stream individual tokens |
 | `seed` | int | -1 | Random seed (-1=random) |
 | `generation-timeout` | int | 300 | Timeout for generation in seconds (0=no timeout) |
+| `enable-buffer-queue` | boolean | FALSE | Queue buffers during model transitions |
+| `max-queued-buffers` | int | 10 | Max buffers to queue (0=unlimited) |
 
 ## Signals
 
@@ -129,9 +134,53 @@ void user_function(GstElement *element,
                    gpointer user_data);
 ```
 
-**Emitted:** After model is unloaded (PAUSED→READY transition)
+**Emitted:** After model is unloaded (via control pad or PAUSED→READY transition)
 
 **Use case:** Cleanup, free resources, track model lifecycle
+
+### model-loading
+
+```c
+void user_function(GstElement *element,
+                   gchar *model_path,
+                   gpointer user_data);
+```
+
+**Emitted:** When asynchronous model loading starts (via control pad `load_model` command)
+**Parameters:**
+- `model_path` - Path to the model being loaded
+
+**Use case:** Show loading UI, display progress indicator, log model changes
+
+### model-load-progress
+
+```c
+void user_function(GstElement *element,
+                   gfloat progress,
+                   gchar *message,
+                   gpointer user_data);
+```
+
+**Emitted:** During asynchronous model loading to report progress
+**Parameters:**
+- `progress` - Loading progress from 0.0 to 1.0
+- `message` - Human-readable progress message (e.g., "Initializing model")
+
+**Use case:** Update progress bars, display status messages, estimate completion time
+
+### model-load-failed
+
+```c
+void user_function(GstElement *element,
+                   gchar *error_message,
+                   gpointer user_data);
+```
+
+**Emitted:** When asynchronous model loading fails
+**Parameters:**
+- `error_message` - Detailed error description
+
+**Use case:** Display error to user, log failures, trigger fallback behavior
 
 ### Signal Example
 
@@ -229,6 +278,65 @@ Update generation parameters at runtime.
 ```json
 {"command": "set_params", "temperature": 0.9, "max_tokens": 50}
 ```
+
+#### load_model
+
+Load a model asynchronously without restarting the pipeline. The element will emit signals during loading.
+
+**Format:**
+```json
+{
+  "command": "load_model",
+  "model_path": <string>,      // Required: path to GGUF model file
+  "n_ctx": <int>,              // Optional: context size (default: 2048)
+  "n_gpu_layers": <int>        // Optional: GPU layers (default: 0)
+}
+```
+
+**Examples:**
+```json
+// Load with defaults
+{"command": "load_model", "model_path": "/models/llama-7b.gguf"}
+
+// Load with custom parameters
+{"command": "load_model", "model_path": "/models/llama-13b.gguf", "n_ctx": 4096, "n_gpu_layers": 32}
+```
+
+**Behavior:**
+- Returns immediately (non-blocking)
+- Emits `model-loading` signal when starting
+- Emits `model-load-progress` signals during loading
+- Emits `model-loaded` signal on success
+- Emits `model-load-failed` signal on failure
+- Model state transitions: `UNLOADED` → `LOADING` → `READY` (or `ERROR`)
+- If buffer queuing is enabled, queued buffers will be processed after loading
+
+**States:**
+- Can be called when model state is `UNLOADED`, `READY`, or `ERROR`
+- Cannot be called when state is `LOADING` or `UNLOADING`
+
+#### unload_model
+
+Unload the current model to free resources.
+
+**Format:**
+```json
+{
+  "command": "unload_model"
+}
+```
+
+**Example:**
+```json
+{"command": "unload_model"}
+```
+
+**Behavior:**
+- Executes synchronously (fast operation)
+- Emits `model-unloaded` signal when complete
+- Model state transitions: `READY` → `UNLOADING` → `UNLOADED`
+- Frees model resources immediately
+- Pipeline can continue running; use `load_model` to load a new model
 
 ### Using the Control Pad
 
@@ -582,6 +690,286 @@ pipeline.set_state(Gst.State.NULL)
 - **Multi-turn conversations**: Natural handling of system/user/assistant messages
 
 **See also:** `examples/json-chat-example.c` for a complete C example
+
+### 7. Dynamic Model Loading
+
+The llama element supports loading and unloading models at runtime via the control pad, without restarting the pipeline. This enables model switching, resource management, and multi-model workflows.
+
+**Use Cases:**
+- Switch between different models based on task requirements
+- Free GPU memory when model is not actively needed
+- Handle model loading errors gracefully without pipeline restart
+- Implement model warmup strategies
+- Build multi-model pipelines with resource sharing
+
+#### Basic Example (Python)
+
+```python
+import gi
+import json
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib
+
+Gst.init(None)
+
+# Create pipeline with unloaded model
+pipeline = Gst.Pipeline.new("dynamic-loading")
+llama = Gst.ElementFactory.make("llama", "generator")
+llama.set_property("enable-buffer-queue", True)  # Queue buffers during loading
+filesink = Gst.ElementFactory.make("filesink", "sink")
+filesink.set_property("location", "output.txt")
+
+# Create control source
+ctrlsrc = Gst.ElementFactory.make("appsrc", "ctrlsrc")
+caps = Gst.Caps.from_string("application/x-llama-control")
+ctrlsrc.set_property("caps", caps)
+
+# Build pipeline
+pipeline.add(llama)
+pipeline.add(filesink)
+pipeline.add(ctrlsrc)
+llama.link(filesink)
+
+# Link control pad
+ctrl_pad = llama.request_pad_simple("ctrl")
+src_pad = ctrlsrc.get_static_pad("src")
+src_pad.link(ctrl_pad)
+
+# Connect to signals
+def on_model_loading(element, model_path):
+    print(f"Loading model: {model_path}")
+
+def on_model_load_progress(element, progress, message):
+    print(f"Progress: {progress*100:.1f}% - {message}")
+
+def on_model_loaded(element, model_path):
+    print(f"Model loaded: {model_path}")
+
+def on_model_load_failed(element, error_msg):
+    print(f"Load failed: {error_msg}")
+
+llama.connect("model-loading", on_model_loading)
+llama.connect("model-load-progress", on_model_load_progress)
+llama.connect("model-loaded", on_model_loaded)
+llama.connect("model-load-failed", on_model_load_failed)
+
+# Start pipeline
+pipeline.set_state(Gst.State.PLAYING)
+
+# Send load_model command
+load_cmd = {
+    "command": "load_model",
+    "model_path": "/models/llama-7b.gguf",
+    "n_ctx": 2048,
+    "n_gpu_layers": 0
+}
+
+cmd_json = json.dumps(load_cmd).encode()
+buffer = Gst.Buffer.new_allocate(None, len(cmd_json), None)
+buffer.fill(0, cmd_json)
+ctrlsrc.emit("push-buffer", buffer)
+
+# Wait for loading to complete
+# In real application, use signals to track completion
+import time
+time.sleep(5)
+
+print("Model ready!")
+
+# Later: unload model to free resources
+unload_cmd = {"command": "unload_model"}
+cmd_json = json.dumps(unload_cmd).encode()
+buffer = Gst.Buffer.new_allocate(None, len(cmd_json), None)
+buffer.fill(0, cmd_json)
+ctrlsrc.emit("push-buffer", buffer)
+
+# Cleanup
+pipeline.set_state(Gst.State.NULL)
+```
+
+#### Model Switching Example
+
+```python
+# Switch between different models without restarting pipeline
+
+def switch_model(llama_element, ctrlsrc, model_path):
+    """Switch to a different model"""
+    # Unload current model
+    unload_cmd = {"command": "unload_model"}
+    send_control_message(ctrlsrc, unload_cmd)
+    time.sleep(1)  # Wait for unload
+
+    # Load new model
+    load_cmd = {
+        "command": "load_model",
+        "model_path": model_path,
+        "n_ctx": 2048
+    }
+    send_control_message(ctrlsrc, load_cmd)
+
+def send_control_message(ctrlsrc, cmd_dict):
+    """Helper to send control messages"""
+    cmd_json = json.dumps(cmd_dict).encode()
+    buffer = Gst.Buffer.new_allocate(None, len(cmd_json), None)
+    buffer.fill(0, cmd_json)
+    ctrlsrc.emit("push-buffer", buffer)
+
+# Example usage
+switch_model(llama, ctrlsrc, "/models/llama-13b.gguf")
+# Wait for loading signals...
+switch_model(llama, ctrlsrc, "/models/codellama-7b.gguf")
+```
+
+#### C Example
+
+```c
+#include <gst/gst.h>
+#include <json-glib/json-glib.h>
+
+// Signal callbacks
+static void on_model_loading(GstElement *element, gchar *model_path, gpointer user_data) {
+    g_print("Loading: %s\n", model_path);
+}
+
+static void on_model_load_progress(GstElement *element, gfloat progress, gchar *message, gpointer user_data) {
+    g_print("Progress: %.1f%% - %s\n", progress * 100, message);
+}
+
+static void on_model_loaded(GstElement *element, gchar *model_path, gpointer user_data) {
+    g_print("Loaded: %s\n", model_path);
+
+    // Signal that we're ready (set flag, emit custom signal, etc.)
+    gboolean *ready = (gboolean *)user_data;
+    *ready = TRUE;
+}
+
+static void on_model_load_failed(GstElement *element, gchar *error_msg, gpointer user_data) {
+    g_print("Failed: %s\n", error_msg);
+}
+
+int main(int argc, char *argv[]) {
+    GstElement *pipeline, *llama, *ctrlsrc, *filesink;
+    GstPad *ctrl_pad, *src_pad;
+    gboolean model_ready = FALSE;
+
+    gst_init(&argc, &argv);
+
+    // Create elements
+    pipeline = gst_pipeline_new("dynamic");
+    llama = gst_element_factory_make("llama", "generator");
+    ctrlsrc = gst_element_factory_make("appsrc", "ctrlsrc");
+    filesink = gst_element_factory_make("filesink", "sink");
+
+    // Configure
+    g_object_set(llama, "enable-buffer-queue", TRUE, NULL);
+    g_object_set(filesink, "location", "output.txt", NULL);
+    g_object_set(ctrlsrc, "caps", gst_caps_from_string("application/x-llama-control"), NULL);
+
+    // Connect signals
+    g_signal_connect(llama, "model-loading", G_CALLBACK(on_model_loading), NULL);
+    g_signal_connect(llama, "model-load-progress", G_CALLBACK(on_model_load_progress), NULL);
+    g_signal_connect(llama, "model-loaded", G_CALLBACK(on_model_loaded), &model_ready);
+    g_signal_connect(llama, "model-load-failed", G_CALLBACK(on_model_load_failed), NULL);
+
+    // Build pipeline
+    gst_bin_add_many(GST_BIN(pipeline), llama, ctrlsrc, filesink, NULL);
+    gst_element_link(llama, filesink);
+
+    // Link control pad
+    ctrl_pad = gst_element_request_pad_simple(llama, "ctrl");
+    src_pad = gst_element_get_static_pad(ctrlsrc, "src");
+    gst_pad_link(src_pad, ctrl_pad);
+    gst_object_unref(src_pad);
+
+    // Start pipeline
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+
+    // Send load_model command
+    const char *load_json =
+        "{\"command\":\"load_model\","
+        "\"model_path\":\"/models/llama-7b.gguf\","
+        "\"n_ctx\":2048}";
+
+    GstBuffer *buffer = gst_buffer_new_allocate(NULL, strlen(load_json), NULL);
+    gst_buffer_fill(buffer, 0, load_json, strlen(load_json));
+
+    GstFlowReturn ret;
+    g_signal_emit_by_name(ctrlsrc, "push-buffer", buffer, &ret);
+    gst_buffer_unref(buffer);
+
+    // Wait for model to load (simplified)
+    g_print("Waiting for model to load...\n");
+    while (!model_ready) {
+        g_usleep(100000);  // 100ms
+    }
+
+    g_print("Model ready, pipeline can now process data!\n");
+
+    // Cleanup
+    gst_element_release_request_pad(llama, ctrl_pad);
+    gst_object_unref(ctrl_pad);
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+
+    return 0;
+}
+```
+
+#### Buffer Queuing During Loading
+
+When `enable-buffer-queue` is enabled, buffers sent to the sink pad during model loading are queued and processed once the model becomes ready:
+
+```python
+# Enable buffer queuing
+llama.set_property("enable-buffer-queue", True)
+llama.set_property("max-queued-buffers", 10)  # 0 = unlimited
+
+# Start pipeline
+pipeline.set_state(Gst.State.PLAYING)
+
+# Send load command (non-blocking)
+send_control_message(ctrlsrc, {
+    "command": "load_model",
+    "model_path": "/models/llama-7b.gguf"
+})
+
+# Can immediately send data - it will be queued
+appsrc.emit("push-buffer", data_buffer)
+
+# Once model is loaded (model-loaded signal), queued buffers are processed automatically
+```
+
+**Without buffer queuing:**
+- Buffers sent during loading return `FLOW_ERROR`
+- Upstream must wait for `model-loaded` signal
+
+**With buffer queuing:**
+- Buffers sent during loading are queued (up to `max-queued-buffers`)
+- Automatically processed when model becomes `READY`
+- Simplifies pipeline logic, no need to coordinate timing
+
+#### Model States
+
+The element tracks model state with the following transitions:
+
+```
+UNLOADED ──load_model──> LOADING ──success──> READY
+                            │
+                            └──failure──> ERROR
+
+READY ──unload_model──> UNLOADING ──> UNLOADED
+
+ERROR ──load_model──> LOADING (retry)
+```
+
+**State Behaviors:**
+- `UNLOADED`: No model loaded, can call `load_model`
+- `LOADING`: Async loading in progress, buffers queued if enabled
+- `READY`: Model loaded, can process data or call `unload_model`
+- `UNLOADING`: Unloading in progress (very brief)
+- `ERROR`: Load failed, can retry with `load_model`
+
+**See also:** `examples/dynamic-loading-example.c` for a complete C example
 
 ## Pad Capabilities
 
