@@ -51,18 +51,25 @@ jobs:
             build-essential \
             cmake \
             libgomp1 \
-            libcurl4-openssl-dev
+            libcurl4-openssl-dev \
+            wget \
+            software-properties-common \
+            gnupg
 
-          # Install clang-format-18 (required for newer .clang-format syntax)
-          # Try versioned package first, fall back to generic
-          sudo apt-get install -y clang-format-18 clang-tidy-18 || \
-          sudo apt-get install -y clang-format clang-tidy
+          # Add LLVM repository for clang-format-18
+          wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+          sudo add-apt-repository -y "deb http://apt.llvm.org/$(lsb_release -sc)/ llvm-toolchain-$(lsb_release -sc)-18 main"
+          sudo apt-get update
 
-          # Make clang-format-18 the default if it exists
-          if command -v clang-format-18 &> /dev/null; then
-            sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
-            sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-18 100
-          fi
+          # Install clang-format-18 and clang-tidy-18
+          sudo apt-get install -y clang-format-18 clang-tidy-18
+
+          # Make clang-format-18 the default
+          sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
+          sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-18 100
+
+          # Verify version
+          clang-format --version
 
       - name: Set up compiler
         run: |
@@ -240,18 +247,26 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cppcheck
+          sudo apt-get install -y \
+            cppcheck \
+            wget \
+            software-properties-common \
+            gnupg
 
-          # Install clang-format-18 (required for newer .clang-format syntax)
-          # Try versioned package first, fall back to generic
-          sudo apt-get install -y clang-format-18 clang-tidy-18 || \
-          sudo apt-get install -y clang-format clang-tidy
+          # Add LLVM repository for clang-format-18
+          wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+          sudo add-apt-repository -y "deb http://apt.llvm.org/$(lsb_release -sc)/ llvm-toolchain-$(lsb_release -sc)-18 main"
+          sudo apt-get update
 
-          # Make clang-format-18 the default if it exists
-          if command -v clang-format-18 &> /dev/null; then
-            sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
-            sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-18 100
-          fi
+          # Install clang-format-18 and clang-tidy-18
+          sudo apt-get install -y clang-format-18 clang-tidy-18
+
+          # Make clang-format-18 the default
+          sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
+          sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-18 100
+
+          # Verify version
+          clang-format --version
 
       - name: Check formatting
         run: |
