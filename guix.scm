@@ -20,10 +20,12 @@
              (guix build-system gnu)
              ((guix licenses) #:prefix license:)
              (gnu packages)
+             (gnu packages build-tools)
              (gnu packages cmake)
              (gnu packages curl)
              (gnu packages glib)
              (gnu packages gstreamer)
+             (gnu packages ninja)
              (gnu packages pkg-config)
              (gnu packages gcc)
              (gnu packages llvm)
@@ -143,20 +145,13 @@ usage from languages like Common Lisp, Python, Ruby, etc. Provides:
           (add-after 'unpack 'set-source-dir
             (lambda _
               ;; Meson expects sources in tools/gstreamer
-              (chdir "tools/gstreamer")))
-          (add-after 'install 'install-examples
-            (lambda* (#:key outputs #:allow-other-keys)
-              (let* ((out (assoc-ref outputs "out"))
-                     (examples (string-append out "/share/examples/gst-llama")))
-                (mkdir-p examples)
-                (copy-recursively "examples" examples)))))))
+              (chdir "tools/gstreamer"))))))
     (native-inputs
      (list pkg-config meson ninja))
     (inputs
      (list gstreamer
            gst-plugins-base
            glib
-           json-glib
            llama-simple))
     (propagated-inputs
      (list llama-simple))
