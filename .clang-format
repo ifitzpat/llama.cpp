@@ -1,7 +1,7 @@
 ---
 Language:        Cpp
 AlignAfterOpenBracket: Align
-AlignArrayOfStructures: Left
+# AlignArrayOfStructures: Left  # Requires clang-format 13+
 AlignConsecutiveAssignments: AcrossComments
 AlignConsecutiveBitFields: AcrossComments
 AlignConsecutiveDeclarations: AcrossComments
@@ -51,9 +51,9 @@ BraceWrapping:
   SplitEmptyRecord: false
   SplitEmptyNamespace: false
 # BreakAdjacentStringLiterals: true
-BreakAfterAttributes: Never
+# BreakAfterAttributes: Never  # Requires clang-format 16+
 BreakBeforeBinaryOperators: None
-BreakBeforeInlineASMColon: OnlyMultiline
+# BreakBeforeInlineASMColon: OnlyMultiline  # Requires clang-format 11+
 BreakBeforeTernaryOperators: false
 # BreakBinaryOperations: Never
 BreakConstructorInitializers: AfterColon
@@ -102,7 +102,7 @@ InsertNewlineAtEOF: true
 JavaScriptQuotes: Leave
 JavaScriptWrapImports: true
 KeepEmptyLinesAtTheStartOfBlocks: false
-LambdaBodyIndentation: Signature
+# LambdaBodyIndentation: Signature  # Requires clang-format 13+
 LineEnding: LF
 MacroBlockBegin: ''
 MacroBlockEnd:   ''
@@ -123,7 +123,7 @@ PenaltyBreakTemplateDeclaration: 10
 PenaltyExcessCharacter: 1000000
 PenaltyReturnTypeOnItsOwnLine: 200
 PointerAlignment: Middle
-QualifierAlignment: Left
+# QualifierAlignment: Left  # Requires clang-format 14+
 #QualifierOrder: ['static', 'inline', 'friend', 'constexpr', 'const', 'volatile', 'type', 'restrict']
 RawStringFormats:
   - Language:        Cpp
@@ -140,7 +140,7 @@ ReferenceAlignment: Middle
 ReflowComments:  false # IndentOnly
 SeparateDefinitionBlocks: Always
 SortIncludes:    CaseInsensitive
-SortUsingDeclarations: LexicographicNumeric
+SortUsingDeclarations: true  # LexicographicNumeric requires clang-format 16+
 SpaceAfterCStyleCast: true
 SpaceAfterLogicalNot: false
 SpaceAfterTemplateKeyword: true
