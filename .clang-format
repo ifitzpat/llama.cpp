@@ -9,9 +9,7 @@ AlignConsecutiveMacros: AcrossComments
 # AlignConsecutiveShortCaseStatements: AcrossComments
 AlignEscapedNewlines: Left # LeftWithLastLine
 AlignOperands:   Align
-AlignTrailingComments:
-  Kind: Always
-  OverEmptyLines: 1
+AlignTrailingComments: true
 AllowAllArgumentsOnNextLine: true
 AllowAllParametersOfDeclarationOnNextLine: false
 # AllowBreakBeforeNoexceptSpecifier: OnlyWithParen
