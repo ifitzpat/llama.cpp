@@ -42,7 +42,7 @@ jobs:
                     (branch "master")))
 
       - name: Cache Guix store
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cache/guix
@@ -65,7 +65,7 @@ jobs:
 
       - name: Upload build logs
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: build-logs-base
           path: build-logs/
@@ -84,7 +84,7 @@ jobs:
         uses: PromyLOPh/guix-install-action@v1
 
       - name: Cache Guix store
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cache/guix
@@ -117,14 +117,14 @@ jobs:
           cp -v /gnu/store/$(guix build -f guix.scm llama-simple | tail -1)/lib/libllama_simple.so* artifacts/ || true
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: llama-simple-lib
           path: artifacts/
 
       - name: Upload build logs
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: build-logs-simple
           path: build-logs/
@@ -143,7 +143,7 @@ jobs:
         uses: PromyLOPh/guix-install-action@v1
 
       - name: Cache Guix store
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cache/guix
@@ -181,14 +181,14 @@ jobs:
           cp -rv $PLUGIN_PATH artifacts/ || true
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: gst-llama-plugin
           path: artifacts/
 
       - name: Upload build logs
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: build-logs-gstreamer
           path: build-logs/
@@ -207,7 +207,7 @@ jobs:
         uses: PromyLOPh/guix-install-action@v1
 
       - name: Cache Guix store
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cache/guix
@@ -244,7 +244,7 @@ jobs:
 
       - name: Upload build report
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: build-report
           path: reports/
@@ -263,7 +263,7 @@ jobs:
         uses: PromyLOPh/guix-install-action@v1
 
       - name: Cache Guix store
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cache/guix
@@ -287,7 +287,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: test-results
           path: |
