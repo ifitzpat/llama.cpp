@@ -33,7 +33,7 @@ Tests across multiple configurations:
 | Ubuntu 24.04 | Clang | Release |
 
 **Steps:**
-1. Install dependencies (CMake, compilers, OpenMP)
+1. Install dependencies (CMake, compilers, OpenMP, libcurl)
 2. Build llama.cpp core libraries
 3. Build llama_simple static library
 4. Run all 19 unit tests

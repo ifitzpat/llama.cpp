@@ -51,6 +51,7 @@ jobs:
             build-essential \
             cmake \
             libgomp1 \
+            libcurl4-openssl-dev \
             clang-format \
             clang-tidy
 
@@ -156,6 +157,7 @@ jobs:
             build-essential \
             cmake \
             libgomp1 \
+            libcurl4-openssl-dev \
             wget
 
       - name: Cache test model

@@ -21,6 +21,7 @@
              ((guix licenses) #:prefix license:)
              (gnu packages)
              (gnu packages cmake)
+             (gnu packages curl)
              (gnu packages glib)
              (gnu packages gstreamer)
              (gnu packages pkg-config)
@@ -69,7 +70,7 @@
     (native-inputs
      (list pkg-config cmake))
     (inputs
-     (list gcc-toolchain))
+     (list gcc-toolchain curl))
     (synopsis "Core llama.cpp libraries")
     (description
      "Core llama.cpp libraries (libllama, libcommon) for running LLM inference.")
