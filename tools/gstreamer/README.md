@@ -1,6 +1,6 @@
 # GStreamer llama.cpp Plugin
 
-**Phase:** 1 - Basic GStreamer Element
+**Phase:** 2 - Signal System
 **Status:** ✅ Implementation Complete
 
 ## Overview
@@ -14,6 +14,7 @@
 - **Configurable properties** - Full control over generation parameters
 - **Model loading** - Loads GGUF models at READY→PAUSED transition
 - **Thread-safe** - Proper locking for concurrent access
+- **GObject signals** - Real-time events for tokens, generation progress, and model lifecycle
 
 ## Architecture
 
@@ -44,6 +45,118 @@
 | `max-tokens` | int | 512 | Maximum tokens to generate |
 | `stream-tokens` | boolean | TRUE | Stream individual tokens |
 | `seed` | int | -1 | Random seed (-1=random) |
+
+## Signals
+
+The `llama` element emits the following GObject signals for real-time monitoring and control:
+
+### token-generated
+
+```c
+void user_function(GstElement *element,
+                   gchar *token,
+                   gint token_id,
+                   gfloat probability,
+                   gint position,
+                   gpointer user_data);
+```
+
+**Emitted:** During text generation for each token
+**Parameters:**
+- `token` - The generated token text
+- `token_id` - Token ID in model vocabulary
+- `probability` - Token probability (0.0-1.0)
+- `position` - Position in generated sequence
+
+**Use case:** Real-time token monitoring, custom streaming output
+
+### generation-started
+
+```c
+void user_function(GstElement *element,
+                   gchar *prompt,
+                   gpointer user_data);
+```
+
+**Emitted:** When text generation begins
+**Parameters:**
+- `prompt` - The input prompt text
+
+**Use case:** Track generation start, measure latency
+
+### generation-complete
+
+```c
+void user_function(GstElement *element,
+                   gchar *full_text,
+                   gint num_tokens,
+                   gchar *stop_reason,
+                   gpointer user_data);
+```
+
+**Emitted:** When text generation completes
+**Parameters:**
+- `full_text` - Complete generated text (placeholder in current implementation)
+- `num_tokens` - Number of tokens generated
+- `stop_reason` - Reason for stopping ("completed", "eos", "max_tokens")
+
+**Use case:** Track generation completion, collect statistics
+
+### model-loaded
+
+```c
+void user_function(GstElement *element,
+                   gchar *model_path,
+                   gpointer user_data);
+```
+
+**Emitted:** After model successfully loads (READY→PAUSED transition)
+**Parameters:**
+- `model_path` - Path to the loaded model file
+
+**Use case:** Confirm model loading, trigger dependent operations
+
+### model-unloaded
+
+```c
+void user_function(GstElement *element,
+                   gpointer user_data);
+```
+
+**Emitted:** After model is unloaded (PAUSED→READY transition)
+
+**Use case:** Cleanup, free resources, track model lifecycle
+
+### Signal Example
+
+See `examples/signal-example.c` for a complete example:
+
+```c
+// Connect to signals
+g_signal_connect(llama, "token-generated",
+                 G_CALLBACK(on_token_generated), NULL);
+g_signal_connect(llama, "model-loaded",
+                 G_CALLBACK(on_model_loaded), NULL);
+
+// Callback function
+static void on_token_generated(GstElement *element,
+                                const gchar *token,
+                                gint token_id,
+                                gfloat probability,
+                                gint position,
+                                gpointer user_data) {
+    g_print("[Token %d] '%s' (prob=%.4f)\n",
+            position, token, probability);
+}
+```
+
+To build and run the example:
+
+```bash
+cd tools/gstreamer/examples
+make
+./signal-example model.gguf input.txt output.txt
+```
 
 ## Build Instructions
 
@@ -232,33 +345,35 @@ export GST_DEBUG=*:3,llama:5
 gst-launch-1.0 ... (your pipeline)
 ```
 
-## Limitations (Phase 1)
+## Limitations (Phase 2)
 
 - **Single model:** Only one model at a time
-- **No signals:** Phase 2 will add GObject signals for events
 - **No control pad:** Phase 3 will add control pad for parameter adjustment
 - **Basic text I/O:** Advanced features (chat templates, etc.) in later phases
+- **Limited statistics:** generation-complete signal currently uses placeholders for full_text
 
 ## Files
 
 ```
 tools/gstreamer/
-├── gstllama.h              # Plugin header
-├── gstllama.c              # Plugin implementation (700+ lines)
-├── meson.build             # Build configuration
-├── meson_options.txt       # Build options
-├── README.md               # This file
+├── gstllama.h                     # Plugin header
+├── gstllama.c                     # Plugin implementation (600+ lines)
+├── meson.build                    # Build configuration
+├── meson_options.txt              # Build options
+├── README.md                      # This file
+├── QUICKSTART.md                  # Standalone build/test guide
+├── build-standalone.sh            # Standalone build script
+├── test-plugin.sh                 # Plugin verification tests
+├── test-pipeline.sh               # Pipeline examples
+├── examples/
+│   ├── signal-example.c           # Signal usage example
+│   └── Makefile                   # Example build configuration
 └── tests/
-    ├── test_plugin.c       # Plugin registration test
-    └── meson.build         # Test build configuration
+    ├── test_plugin.c              # Plugin registration test
+    └── meson.build                # Test build configuration
 ```
 
 ## Next Phases
-
-**Phase 2:** Signal System
-- Add GObject signals (`token-generated`, `logits-ready`, etc.)
-- Real-time parameter adjustment
-- Progress notifications
 
 **Phase 3:** Control Pad
 - Dedicated control pad for steering
@@ -281,5 +396,5 @@ See main llama.cpp [CONTRIBUTING.md](../../CONTRIBUTING.md)
 ---
 
 **Last Updated:** 2025-11-08
-**Phase:** 1 - Basic Element
+**Phase:** 2 - Signal System
 **Status:** ✅ Complete
