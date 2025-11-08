@@ -24,6 +24,15 @@ G_BEGIN_DECLS
 #define GST_TYPE_LLAMA (gst_llama_get_type())
 G_DECLARE_FINAL_TYPE(GstLlama, gst_llama, GST, LLAMA, GstElement)
 
+/* Model state enum for lifecycle management */
+typedef enum {
+    GST_LLAMA_MODEL_STATE_UNLOADED,  /* No model loaded */
+    GST_LLAMA_MODEL_STATE_LOADING,   /* Model loading in progress */
+    GST_LLAMA_MODEL_STATE_READY,     /* Model loaded and ready */
+    GST_LLAMA_MODEL_STATE_UNLOADING, /* Model unloading in progress */
+    GST_LLAMA_MODEL_STATE_ERROR      /* Model in error state */
+} GstLlamaModelState;
+
 struct _GstLlama {
     GstElement parent;
 
@@ -44,12 +53,15 @@ struct _GstLlama {
     gint     max_tokens;
     gboolean stream_tokens;
     gint     seed;
-    gint     generation_timeout; /* Timeout in seconds (0 = no timeout) */
+    gint     generation_timeout;  /* Timeout in seconds (0 = no timeout) */
+    gboolean enable_buffer_queue; /* Enable buffering during model transitions */
+    gint     max_queued_buffers;  /* Maximum buffers to queue (0 = unlimited) */
 
     /* State */
-    gboolean model_loaded;
-    GMutex   lock;
-    GCond    cond;
+    gboolean           model_loaded; /* Deprecated: use model_state instead */
+    GstLlamaModelState model_state;  /* Current model state */
+    GMutex             lock;
+    GCond              cond;
 
     /* llama.cpp context */
     llama_simple_context * llama_ctx;
@@ -59,6 +71,17 @@ struct _GstLlama {
     gboolean eos_received;
     gboolean generation_aborted;    /* Flag for timeout/error aborts */
     gint64   generation_start_time; /* Start time for timeout tracking */
+
+    /* Model loading thread */
+    GThread * loading_thread;         /* Async loading thread */
+    gboolean  loading_thread_running; /* Thread control flag */
+    gboolean  loading_thread_cancel;  /* Request thread cancellation */
+    gchar *   loading_error;          /* Error message from failed load */
+    gfloat    loading_progress;       /* Loading progress (0.0-1.0) */
+
+    /* Buffer queue for transitions */
+    GQueue * buffer_queue; /* Queue of GstBuffer* during model transitions */
+    gint     queued_count; /* Number of buffers currently queued */
 };
 
 G_END_DECLS

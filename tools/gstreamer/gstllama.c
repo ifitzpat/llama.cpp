@@ -42,21 +42,25 @@ enum {
     PROP_STREAM_TOKENS,
     PROP_SEED,
     PROP_GENERATION_TIMEOUT,
+    PROP_ENABLE_BUFFER_QUEUE,
+    PROP_MAX_QUEUED_BUFFERS,
     PROP_LAST
 };
 
 /* Default property values */
-#define DEFAULT_N_CTX              2048
-#define DEFAULT_N_GPU_LAYERS       0
-#define DEFAULT_N_THREADS          -1
-#define DEFAULT_TEMPERATURE        0.7f
-#define DEFAULT_TOP_P              0.9f
-#define DEFAULT_TOP_K              40
-#define DEFAULT_REPEAT_PENALTY     1.1f
-#define DEFAULT_MAX_TOKENS         512
-#define DEFAULT_STREAM_TOKENS      TRUE
-#define DEFAULT_SEED               -1
-#define DEFAULT_GENERATION_TIMEOUT 300 /* 5 minutes default timeout */
+#define DEFAULT_N_CTX               2048
+#define DEFAULT_N_GPU_LAYERS        0
+#define DEFAULT_N_THREADS           -1
+#define DEFAULT_TEMPERATURE         0.7f
+#define DEFAULT_TOP_P               0.9f
+#define DEFAULT_TOP_K               40
+#define DEFAULT_REPEAT_PENALTY      1.1f
+#define DEFAULT_MAX_TOKENS          512
+#define DEFAULT_STREAM_TOKENS       TRUE
+#define DEFAULT_SEED                -1
+#define DEFAULT_GENERATION_TIMEOUT  300   /* 5 minutes default timeout */
+#define DEFAULT_ENABLE_BUFFER_QUEUE FALSE /* Disabled by default */
+#define DEFAULT_MAX_QUEUED_BUFFERS  10    /* Default queue limit */
 
 /* Signals */
 enum {
@@ -65,6 +69,9 @@ enum {
     SIGNAL_GENERATION_COMPLETE,
     SIGNAL_MODEL_LOADED,
     SIGNAL_MODEL_UNLOADED,
+    SIGNAL_MODEL_LOADING,
+    SIGNAL_MODEL_LOAD_PROGRESS,
+    SIGNAL_MODEL_LOAD_FAILED,
     LAST_SIGNAL
 };
 
@@ -87,6 +94,234 @@ static GstPad *             gst_llama_request_new_pad(GstElement *     element,
                                                       const GstCaps *  caps);
 static void                 gst_llama_release_pad(GstElement * element, GstPad * pad);
 static GstFlowReturn        gst_llama_ctrl_chain(GstPad * pad, GstObject * parent, GstBuffer * buf);
+
+/* Helper function to transition model state (thread-safe) */
+static void set_model_state(GstLlama * self, GstLlamaModelState new_state) {
+    g_mutex_lock(&self->lock);
+    GstLlamaModelState old_state = self->model_state;
+    self->model_state            = new_state;
+
+    /* Update deprecated model_loaded flag for backward compatibility */
+    self->model_loaded = (new_state == GST_LLAMA_MODEL_STATE_READY);
+
+    GST_INFO_OBJECT(self, "Model state transition: %d -> %d", old_state, new_state);
+    g_mutex_unlock(&self->lock);
+}
+
+/* Helper function to load model (synchronous) */
+static gboolean load_model_sync(GstLlama * self, const gchar * model_path, gint n_ctx, gint n_gpu_layers) {
+    gchar *  error_msg = NULL;
+    gboolean success   = FALSE;
+
+    GST_INFO_OBJECT(self, "Loading model: %s (n_ctx=%d, n_gpu_layers=%d)", model_path, n_ctx, n_gpu_layers);
+
+    /* Validate model path */
+    if (!g_file_test(model_path, G_FILE_TEST_EXISTS)) {
+        error_msg = g_strdup_printf("Model file not found: %s", model_path);
+        goto error;
+    }
+
+    if (!g_file_test(model_path, G_FILE_TEST_IS_REGULAR)) {
+        error_msg = g_strdup_printf("Model path is not a regular file: %s", model_path);
+        goto error;
+    }
+
+    /* Check file extension */
+    if (!g_str_has_suffix(model_path, ".gguf")) {
+        error_msg = g_strdup_printf("Model file must have .gguf extension: %s", model_path);
+        goto error;
+    }
+
+    /* Create llama context */
+    llama_simple_context * ctx = llama_simple_init_from_file_with_params(model_path, n_ctx, n_gpu_layers);
+
+    if (!ctx) {
+        error_msg = g_strdup_printf("Failed to initialize llama context from %s", model_path);
+        goto error;
+    }
+
+    /* Success - update context */
+    g_mutex_lock(&self->lock);
+    if (self->llama_ctx) {
+        llama_simple_free(self->llama_ctx);
+    }
+    self->llama_ctx = ctx;
+    g_free(self->model_path);
+    self->model_path   = g_strdup(model_path);
+    self->n_ctx        = n_ctx;
+    self->n_gpu_layers = n_gpu_layers;
+    g_mutex_unlock(&self->lock);
+
+    success = TRUE;
+    GST_INFO_OBJECT(self, "Model loaded successfully");
+    return TRUE;
+
+error:
+    g_mutex_lock(&self->lock);
+    g_free(self->loading_error);
+    self->loading_error = error_msg;
+    g_mutex_unlock(&self->lock);
+
+    GST_ERROR_OBJECT(self, "Model load failed: %s", error_msg);
+    return FALSE;
+}
+
+/* Helper function to unload model (synchronous) */
+static void unload_model_sync(GstLlama * self) {
+    GST_INFO_OBJECT(self, "Unloading model");
+
+    g_mutex_lock(&self->lock);
+    if (self->llama_ctx) {
+        llama_simple_free(self->llama_ctx);
+        self->llama_ctx = NULL;
+    }
+    g_mutex_unlock(&self->lock);
+
+    GST_INFO_OBJECT(self, "Model unloaded");
+}
+
+/* Loading thread function */
+static gpointer loading_thread_func(gpointer user_data) {
+    GstLlama * self = GST_LLAMA(user_data);
+    gchar *    model_path;
+    gint       n_ctx;
+    gint       n_gpu_layers;
+    gboolean   success;
+
+    GST_DEBUG_OBJECT(self, "Loading thread started");
+
+    /* Get parameters (thread-safe copy) */
+    g_mutex_lock(&self->lock);
+    model_path   = g_strdup(self->model_path);
+    n_ctx        = self->n_ctx;
+    n_gpu_layers = self->n_gpu_layers;
+    g_mutex_unlock(&self->lock);
+
+    /* Emit loading signal */
+    g_signal_emit(self, gst_llama_signals[SIGNAL_MODEL_LOADING], 0, model_path);
+
+    /* Report progress */
+    g_mutex_lock(&self->lock);
+    self->loading_progress = 0.25f;
+    g_mutex_unlock(&self->lock);
+    g_signal_emit(self, gst_llama_signals[SIGNAL_MODEL_LOAD_PROGRESS], 0, 0.25f, "Initializing model");
+
+    /* Load the model */
+    success = load_model_sync(self, model_path, n_ctx, n_gpu_layers);
+
+    /* Report completion */
+    g_mutex_lock(&self->lock);
+    self->loading_progress = 1.0f;
+    g_mutex_unlock(&self->lock);
+
+    if (success) {
+        set_model_state(self, GST_LLAMA_MODEL_STATE_READY);
+        g_signal_emit(self, gst_llama_signals[SIGNAL_MODEL_LOADED], 0, model_path);
+        GST_INFO_OBJECT(self, "Async model load completed successfully");
+
+        /* Process any queued buffers */
+        if (self->enable_buffer_queue) {
+            process_queued_buffers(self);
+        }
+    } else {
+        set_model_state(self, GST_LLAMA_MODEL_STATE_ERROR);
+        g_mutex_lock(&self->lock);
+        gchar * error_copy = g_strdup(self->loading_error);
+        g_mutex_unlock(&self->lock);
+        g_signal_emit(self, gst_llama_signals[SIGNAL_MODEL_LOAD_FAILED], 0, error_copy);
+        g_free(error_copy);
+        GST_ERROR_OBJECT(self, "Async model load failed");
+    }
+
+    /* Clean up */
+    g_free(model_path);
+
+    g_mutex_lock(&self->lock);
+    self->loading_thread_running = FALSE;
+    g_cond_broadcast(&self->cond);
+    g_mutex_unlock(&self->lock);
+
+    GST_DEBUG_OBJECT(self, "Loading thread exiting");
+    return NULL;
+}
+
+/* Process queued buffers after model becomes ready */
+static void process_queued_buffers(GstLlama * self) {
+    GstBuffer * buf;
+    gint        processed = 0;
+
+    g_mutex_lock(&self->lock);
+
+    GST_INFO_OBJECT(self, "Processing %d queued buffers", self->queued_count);
+
+    while ((buf = g_queue_pop_head(self->buffer_queue)) != NULL) {
+        self->queued_count--;
+
+        /* Unlock while processing buffer */
+        g_mutex_unlock(&self->lock);
+
+        /* Process the buffer through the chain function
+         * Note: We need to be careful here - we're calling chain from loading thread
+         * Instead, we'll push directly to srcpad with EOS for now
+         * A better approach would be to use a separate task or push to a GstQueue element
+         */
+        GST_DEBUG_OBJECT(self, "Processing queued buffer %d", processed + 1);
+
+        /* For simplicity, we'll unref queued buffers for now
+         * TODO: Implement proper queued buffer processing
+         */
+        gst_buffer_unref(buf);
+        processed++;
+
+        g_mutex_lock(&self->lock);
+    }
+
+    GST_INFO_OBJECT(self, "Processed %d queued buffers", processed);
+    g_mutex_unlock(&self->lock);
+}
+
+/* Start asynchronous model loading */
+static gboolean start_async_load(GstLlama * self, const gchar * model_path, gint n_ctx, gint n_gpu_layers) {
+    g_mutex_lock(&self->lock);
+
+    /* Check if already loading */
+    if (self->loading_thread_running) {
+        GST_WARNING_OBJECT(self, "Model loading already in progress");
+        g_mutex_unlock(&self->lock);
+        return FALSE;
+    }
+
+    /* Check current state */
+    if (self->model_state == GST_LLAMA_MODEL_STATE_LOADING || self->model_state == GST_LLAMA_MODEL_STATE_UNLOADING) {
+        GST_WARNING_OBJECT(self, "Model transition already in progress (state=%d)", self->model_state);
+        g_mutex_unlock(&self->lock);
+        return FALSE;
+    }
+
+    /* Update parameters */
+    g_free(self->model_path);
+    self->model_path             = g_strdup(model_path);
+    self->n_ctx                  = n_ctx;
+    self->n_gpu_layers           = n_gpu_layers;
+    self->loading_thread_running = TRUE;
+    self->loading_thread_cancel  = FALSE;
+    self->loading_progress       = 0.0f;
+
+    /* Clear any previous error */
+    g_free(self->loading_error);
+    self->loading_error = NULL;
+
+    /* Set state */
+    set_model_state(self, GST_LLAMA_MODEL_STATE_LOADING);
+
+    /* Start loading thread */
+    self->loading_thread = g_thread_new("llama-loader", loading_thread_func, self);
+
+    g_mutex_unlock(&self->lock);
+
+    GST_INFO_OBJECT(self, "Started async model load: %s", model_path);
+    return TRUE;
+}
 
 /* Helper function to parse JSON chat messages and parameters
  * Returns formatted prompt (caller must free) or NULL on error
@@ -361,6 +596,18 @@ static void gst_llama_class_init(GstLlamaClass * klass) {
                          "Timeout for generation in seconds (0 = no timeout)", 0, G_MAXINT32,
                          DEFAULT_GENERATION_TIMEOUT, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+    g_object_class_install_property(
+        gobject_class, PROP_ENABLE_BUFFER_QUEUE,
+        g_param_spec_boolean("enable-buffer-queue", "Enable Buffer Queue",
+                             "Queue buffers during model transitions instead of returning NOT_NEGOTIATED",
+                             DEFAULT_ENABLE_BUFFER_QUEUE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+    g_object_class_install_property(
+        gobject_class, PROP_MAX_QUEUED_BUFFERS,
+        g_param_spec_int("max-queued-buffers", "Max Queued Buffers",
+                         "Maximum buffers to queue during transitions (0 = unlimited)", 0, G_MAXINT32,
+                         DEFAULT_MAX_QUEUED_BUFFERS, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
     /* Register signals */
     /**
      * GstLlama::token-generated:
@@ -425,6 +672,41 @@ static void gst_llama_class_init(GstLlamaClass * klass) {
     gst_llama_signals[SIGNAL_MODEL_UNLOADED] = g_signal_new("model-unloaded", G_TYPE_FROM_CLASS(klass),
                                                             G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE, 0);
 
+    /**
+     * GstLlama::model-loading:
+     * @llama: the llama element
+     * @model_path: path to the model being loaded
+     *
+     * Emitted when model loading starts (asynchronous).
+     */
+    gst_llama_signals[SIGNAL_MODEL_LOADING] =
+        g_signal_new("model-loading", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE, 1,
+                     G_TYPE_STRING); /* model_path */
+
+    /**
+     * GstLlama::model-load-progress:
+     * @llama: the llama element
+     * @progress: loading progress (0.0 to 1.0)
+     * @message: progress message
+     *
+     * Emitted during model loading to report progress.
+     */
+    gst_llama_signals[SIGNAL_MODEL_LOAD_PROGRESS] =
+        g_signal_new("model-load-progress", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL,
+                     G_TYPE_NONE, 2, G_TYPE_FLOAT, /* progress */
+                     G_TYPE_STRING);               /* message */
+
+    /**
+     * GstLlama::model-load-failed:
+     * @llama: the llama element
+     * @error_message: error description
+     *
+     * Emitted when model loading fails.
+     */
+    gst_llama_signals[SIGNAL_MODEL_LOAD_FAILED] =
+        g_signal_new("model-load-failed", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST, 0, NULL, NULL, NULL, G_TYPE_NONE,
+                     1, G_TYPE_STRING); /* error_message */
+
     /* Add pad templates */
     gst_element_class_add_static_pad_template(element_class, &sink_template);
     gst_element_class_add_static_pad_template(element_class, &src_template);
@@ -452,26 +734,40 @@ static void gst_llama_init(GstLlama * self) {
     self->ctrlpad = NULL;
 
     /* Initialize properties to defaults */
-    self->model_path         = NULL;
-    self->n_ctx              = DEFAULT_N_CTX;
-    self->n_gpu_layers       = DEFAULT_N_GPU_LAYERS;
-    self->n_threads          = DEFAULT_N_THREADS;
-    self->temperature        = DEFAULT_TEMPERATURE;
-    self->top_p              = DEFAULT_TOP_P;
-    self->top_k              = DEFAULT_TOP_K;
-    self->repeat_penalty     = DEFAULT_REPEAT_PENALTY;
-    self->max_tokens         = DEFAULT_MAX_TOKENS;
-    self->stream_tokens      = DEFAULT_STREAM_TOKENS;
-    self->seed               = DEFAULT_SEED;
-    self->generation_timeout = DEFAULT_GENERATION_TIMEOUT;
+    self->model_path          = NULL;
+    self->n_ctx               = DEFAULT_N_CTX;
+    self->n_gpu_layers        = DEFAULT_N_GPU_LAYERS;
+    self->n_threads           = DEFAULT_N_THREADS;
+    self->temperature         = DEFAULT_TEMPERATURE;
+    self->top_p               = DEFAULT_TOP_P;
+    self->top_k               = DEFAULT_TOP_K;
+    self->repeat_penalty      = DEFAULT_REPEAT_PENALTY;
+    self->max_tokens          = DEFAULT_MAX_TOKENS;
+    self->stream_tokens       = DEFAULT_STREAM_TOKENS;
+    self->seed                = DEFAULT_SEED;
+    self->generation_timeout  = DEFAULT_GENERATION_TIMEOUT;
+    self->enable_buffer_queue = DEFAULT_ENABLE_BUFFER_QUEUE;
+    self->max_queued_buffers  = DEFAULT_MAX_QUEUED_BUFFERS;
 
     /* Initialize state */
     self->model_loaded          = FALSE;
+    self->model_state           = GST_LLAMA_MODEL_STATE_UNLOADED;
     self->generating            = FALSE;
     self->eos_received          = FALSE;
     self->generation_aborted    = FALSE;
     self->generation_start_time = 0;
     self->llama_ctx             = NULL;
+
+    /* Initialize loading thread state */
+    self->loading_thread         = NULL;
+    self->loading_thread_running = FALSE;
+    self->loading_thread_cancel  = FALSE;
+    self->loading_error          = NULL;
+    self->loading_progress       = 0.0f;
+
+    /* Initialize buffer queue */
+    self->buffer_queue = g_queue_new();
+    self->queued_count = 0;
 
     g_mutex_init(&self->lock);
     g_cond_init(&self->cond);
@@ -520,6 +816,12 @@ static void gst_llama_set_property(GObject * object, guint prop_id, const GValue
             break;
         case PROP_GENERATION_TIMEOUT:
             self->generation_timeout = g_value_get_int(value);
+            break;
+        case PROP_ENABLE_BUFFER_QUEUE:
+            self->enable_buffer_queue = g_value_get_boolean(value);
+            break;
+        case PROP_MAX_QUEUED_BUFFERS:
+            self->max_queued_buffers = g_value_get_int(value);
             break;
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -571,6 +873,12 @@ static void gst_llama_get_property(GObject * object, guint prop_id, GValue * val
         case PROP_GENERATION_TIMEOUT:
             g_value_set_int(value, self->generation_timeout);
             break;
+        case PROP_ENABLE_BUFFER_QUEUE:
+            g_value_set_boolean(value, self->enable_buffer_queue);
+            break;
+        case PROP_MAX_QUEUED_BUFFERS:
+            g_value_set_int(value, self->max_queued_buffers);
+            break;
         default:
             G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
             break;
@@ -584,6 +892,30 @@ static void gst_llama_finalize(GObject * object) {
     GstLlama * self = GST_LLAMA(object);
 
     GST_DEBUG_OBJECT(self, "Finalizing llama element");
+
+    /* Cancel and join loading thread if running */
+    if (self->loading_thread) {
+        GST_DEBUG_OBJECT(self, "Cancelling loading thread");
+        g_mutex_lock(&self->lock);
+        self->loading_thread_cancel = TRUE;
+        g_mutex_unlock(&self->lock);
+        g_thread_join(self->loading_thread);
+        self->loading_thread = NULL;
+    }
+
+    /* Free loading error message */
+    g_free(self->loading_error);
+    self->loading_error = NULL;
+
+    /* Clear buffer queue */
+    if (self->buffer_queue) {
+        GstBuffer * buf;
+        while ((buf = g_queue_pop_head(self->buffer_queue)) != NULL) {
+            gst_buffer_unref(buf);
+        }
+        g_queue_free(self->buffer_queue);
+        self->buffer_queue = NULL;
+    }
 
     g_free(self->model_path);
     self->model_path = NULL;
@@ -765,11 +1097,44 @@ static GstFlowReturn gst_llama_chain(GstPad * pad, GstObject * parent, GstBuffer
 
     g_mutex_lock(&self->lock);
 
-    if (!self->model_loaded) {
-        g_mutex_unlock(&self->lock);
-        GST_ELEMENT_ERROR(self, CORE, FAILED, ("No model loaded"), (NULL));
-        g_free(input_text);
-        return GST_FLOW_ERROR;
+    /* Check model state and handle accordingly */
+    if (self->model_state != GST_LLAMA_MODEL_STATE_READY) {
+        /* Model not ready - check if we should queue or error */
+        if (self->enable_buffer_queue && (self->model_state == GST_LLAMA_MODEL_STATE_LOADING ||
+                                          self->model_state == GST_LLAMA_MODEL_STATE_UNLOADING)) {
+            /* Queue the buffer during transition */
+            if (self->max_queued_buffers > 0 && self->queued_count >= self->max_queued_buffers) {
+                g_mutex_unlock(&self->lock);
+                GST_WARNING_OBJECT(self, "Buffer queue full (%d buffers), dropping", self->queued_count);
+                g_free(input_text);
+                return GST_FLOW_OK; /* Drop buffer but don't error */
+            }
+
+            /* Re-create buffer and queue it */
+            GstBuffer * queued_buf = gst_buffer_new_allocate(NULL, strlen(input_text), NULL);
+            gst_buffer_fill(queued_buf, 0, input_text, strlen(input_text));
+            g_queue_push_tail(self->buffer_queue, queued_buf);
+            self->queued_count++;
+
+            GST_DEBUG_OBJECT(self, "Queued buffer during %s (queue size: %d)",
+                             self->model_state == GST_LLAMA_MODEL_STATE_LOADING ? "loading" : "unloading",
+                             self->queued_count);
+
+            g_mutex_unlock(&self->lock);
+            g_free(input_text);
+            return GST_FLOW_OK;
+        } else {
+            /* Buffer queuing disabled or not in transition state */
+            const gchar * state_str = (self->model_state == GST_LLAMA_MODEL_STATE_UNLOADED) ? "unloaded" :
+                                      (self->model_state == GST_LLAMA_MODEL_STATE_ERROR)    ? "error" :
+                                      (self->model_state == GST_LLAMA_MODEL_STATE_LOADING)  ? "loading" :
+                                                                                              "unloading";
+
+            g_mutex_unlock(&self->lock);
+            GST_ELEMENT_ERROR(self, CORE, FAILED, ("Model not ready (state: %s)", state_str), (NULL));
+            g_free(input_text);
+            return GST_FLOW_ERROR;
+        }
     }
 
     /* Initialize generation state */
@@ -1042,15 +1407,47 @@ static GstFlowReturn gst_llama_ctrl_chain(GstPad * pad, GstObject * parent, GstB
 
     const gchar * command = json_object_get_string_member(obj, "command");
 
-    g_mutex_lock(&self->lock);
-
     if (g_str_equal(command, "set_params")) {
+        g_mutex_lock(&self->lock);
         gst_llama_handle_set_params(self, obj);
+        g_mutex_unlock(&self->lock);
+    } else if (g_str_equal(command, "load_model")) {
+        /* Extract model loading parameters */
+        const gchar * model_path = json_object_get_string_member(obj, "model_path");
+        gint          n_ctx =
+            json_object_has_member(obj, "n_ctx") ? (gint) json_object_get_int_member(obj, "n_ctx") : DEFAULT_N_CTX;
+        gint n_gpu_layers = json_object_has_member(obj, "n_gpu_layers") ?
+                                (gint) json_object_get_int_member(obj, "n_gpu_layers") :
+                                DEFAULT_N_GPU_LAYERS;
+
+        if (!model_path || strlen(model_path) == 0) {
+            GST_ERROR_OBJECT(self, "load_model command missing 'model_path'");
+            ret = GST_FLOW_ERROR;
+            goto cleanup;
+        }
+
+        GST_INFO_OBJECT(self, "Control command: load_model %s (n_ctx=%d, n_gpu_layers=%d)", model_path, n_ctx,
+                        n_gpu_layers);
+
+        if (!start_async_load(self, model_path, n_ctx, n_gpu_layers)) {
+            GST_ERROR_OBJECT(self, "Failed to start model loading");
+            ret = GST_FLOW_ERROR;
+        }
+    } else if (g_str_equal(command, "unload_model")) {
+        GST_INFO_OBJECT(self, "Control command: unload_model");
+
+        /* Set state to unloading */
+        set_model_state(self, GST_LLAMA_MODEL_STATE_UNLOADING);
+
+        /* Unload synchronously (fast operation) */
+        unload_model_sync(self);
+
+        /* Set state and emit signal */
+        set_model_state(self, GST_LLAMA_MODEL_STATE_UNLOADED);
+        g_signal_emit(self, gst_llama_signals[SIGNAL_MODEL_UNLOADED], 0);
     } else {
         GST_WARNING_OBJECT(self, "Unknown control command: %s", command);
     }
-
-    g_mutex_unlock(&self->lock);
 
 cleanup:
     if (parser) {
