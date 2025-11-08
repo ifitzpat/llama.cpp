@@ -3,6 +3,7 @@ name: Guix Build
 on:
   push:
     branches:
+      - claude/gstreamer-implementation-011CUrgj9DxaFqUMTWowxyBi
       - claude/integration-scenarios-ffi-gstreamer
       - main
     paths:

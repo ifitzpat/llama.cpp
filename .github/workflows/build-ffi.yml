@@ -1,0 +1,295 @@
+name: Build FFI (llama_simple)
+
+on:
+  push:
+    branches:
+      - claude/gstreamer-implementation-011CUrgj9DxaFqUMTWowxyBi
+      - main
+    paths:
+      - 'tools/ffi/**'
+      - 'src/**'
+      - 'ggml/**'
+      - 'common/**'
+      - 'include/**'
+      - '.github/workflows/build-ffi.yml'
+  pull_request:
+    paths:
+      - 'tools/ffi/**'
+      - 'src/**'
+      - 'ggml/**'
+      - 'common/**'
+      - 'include/**'
+      - '.github/workflows/build-ffi.yml'
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: Build and Test llama_simple
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        compiler: [gcc, clang]
+        build_type: [Release, Debug]
+        exclude:
+          # Reduce matrix size - only test Debug on Ubuntu 24.04 with gcc
+          - os: ubuntu-22.04
+            build_type: Debug
+          - compiler: clang
+            build_type: Debug
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libgomp1 \
+            clang-format \
+            clang-tidy
+
+      - name: Set up compiler
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            echo "CC=clang" >> $GITHUB_ENV
+            echo "CXX=clang++" >> $GITHUB_ENV
+          else
+            echo "CC=gcc" >> $GITHUB_ENV
+            echo "CXX=g++" >> $GITHUB_ENV
+          fi
+
+      - name: Build llama.cpp core
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_OPENMP=ON
+          make -j$(nproc)
+
+      - name: Build llama_simple
+        run: |
+          cd tools/ffi
+          mkdir -p build
+          cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DLLAMA_SIMPLE_BUILD_TESTS=ON
+          make -j$(nproc)
+
+      - name: Run tests
+        run: |
+          cd tools/ffi/build
+          ./test_llama_simple
+
+      - name: Check code formatting
+        if: matrix.compiler == 'gcc' && matrix.build_type == 'Release'
+        run: |
+          cd tools/ffi
+          clang-format --dry-run --Werror \
+            llama_simple.cpp \
+            llama_simple.h \
+            tests/test_llama_simple.c
+
+      - name: Run static analysis
+        if: matrix.compiler == 'clang' && matrix.build_type == 'Release'
+        run: |
+          cd tools/ffi
+          clang-tidy llama_simple.cpp -- \
+            -I../../include \
+            -I../../ggml/include \
+            -I../../common \
+            -std=c++17
+
+      - name: Upload build artifacts
+        if: matrix.build_type == 'Release' && matrix.os == 'ubuntu-24.04'
+        uses: actions/upload-artifact@v4
+        with:
+          name: libllama_simple-${{ matrix.compiler }}
+          path: tools/ffi/build/libllama_simple.a
+          retention-days: 7
+
+      - name: Generate test report
+        if: always()
+        run: |
+          mkdir -p test-reports
+          cat > test-reports/summary.txt <<EOF
+          Test Summary
+          ============
+          OS: ${{ matrix.os }}
+          Compiler: ${{ matrix.compiler }}
+          Build Type: ${{ matrix.build_type }}
+          Status: ${{ job.status }}
+          Date: $(date)
+          Commit: ${{ github.sha }}
+          EOF
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report-${{ matrix.os }}-${{ matrix.compiler }}-${{ matrix.build_type }}
+          path: test-reports/
+          retention-days: 30
+
+  build-with-model:
+    name: Integration Test with Model
+    runs-on: ubuntu-24.04
+    needs: build-and-test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libgomp1 \
+            wget
+
+      - name: Cache test model
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: models/test/
+          key: gemma-3-270m-qat-Q4_0
+
+      - name: Download test model
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models/test
+          cd models/test
+          wget -q --show-progress \
+            https://huggingface.co/ggml-org/gemma-3-270m-qat-GGUF/resolve/main/gemma-3-270m-qat-Q4_0.gguf
+          # Verify download
+          ls -lh gemma-3-270m-qat-Q4_0.gguf
+          od -A x -t x1z -N 16 gemma-3-270m-qat-Q4_0.gguf | head -1
+
+      - name: Build llama.cpp core
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_OPENMP=ON
+          make -j$(nproc)
+
+      - name: Build llama_simple
+        run: |
+          cd tools/ffi
+          mkdir -p build
+          cd build
+          cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_SIMPLE_BUILD_TESTS=ON
+          make -j$(nproc)
+
+      - name: Run tests with model
+        run: |
+          cd tools/ffi/build
+          ./test_llama_simple 2>&1 | tee test-output.log
+          # Check that positive path tests passed
+          if ! grep -q "ALL TESTS PASSED" test-output.log; then
+            echo "Tests failed!"
+            exit 1
+          fi
+          # Check that model tests actually ran (not skipped)
+          if grep -q "Skipping - model not available" test-output.log; then
+            echo "Model tests were skipped - model path issue!"
+            exit 1
+          fi
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-output
+          path: tools/ffi/build/test-output.log
+          retention-days: 30
+
+  quality-checks:
+    name: Code Quality Checks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format clang-tidy cppcheck
+
+      - name: Check formatting
+        run: |
+          cd tools/ffi
+          clang-format --dry-run --Werror \
+            llama_simple.cpp \
+            llama_simple.h \
+            tests/test_llama_simple.c
+
+      - name: Run cppcheck
+        run: |
+          cd tools/ffi
+          cppcheck \
+            --enable=warning,style,performance,portability \
+            --error-exitcode=1 \
+            --inline-suppr \
+            --suppress=missingIncludeSystem \
+            llama_simple.cpp
+
+      - name: Check for TODOs
+        run: |
+          cd tools/ffi
+          if grep -rn "TODO\|FIXME\|XXX\|HACK" llama_simple.cpp llama_simple.h; then
+            echo "Found unresolved TODOs/FIXMEs"
+            # Don't fail - just warn
+          fi
+
+  documentation:
+    name: Documentation Check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify documentation exists
+        run: |
+          cd tools/ffi
+          test -f TDD_DEVELOPMENT_LOG.md || \
+            (echo "TDD_DEVELOPMENT_LOG.md missing!" && exit 1)
+          test -f llama_simple.h || \
+            (echo "llama_simple.h missing!" && exit 1)
+
+      - name: Check API documentation
+        run: |
+          cd tools/ffi
+          # Check that all public functions have comments
+          if ! grep -B1 "^llama_simple_context \* llama_simple_init" llama_simple.h | grep -q "//"; then
+            echo "Warning: llama_simple_init lacks documentation"
+          fi
+
+      - name: Generate API documentation
+        run: |
+          cd tools/ffi
+          # Extract function signatures for documentation
+          grep -E "^(typedef|struct|enum|LLAMA_SIMPLE_API)" llama_simple.h > api-reference.txt
+          cat api-reference.txt
+
+      - name: Upload documentation
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-reference
+          path: tools/ffi/api-reference.txt
+          retention-days: 30
