@@ -2,6 +2,9 @@
 
 This guide explains how to create a standalone `gstreamer-llama` project with llama.cpp as a dependency.
 
+**Current Phase:** 5B - Dynamic Model Loading
+**Last Updated:** 2025-11-08
+
 ## Overview
 
 The GStreamer plugin is currently embedded in the llama.cpp repository at `tools/gstreamer/`. To spin it off, we'll create an independent repository that depends on llama.cpp's C API (`llama_simple`).
@@ -25,6 +28,8 @@ gstreamer-llama/
 ├── examples/
 │   ├── signal-example.c               # Signal usage example
 │   ├── control-pad-example.c          # Control pad example
+│   ├── json-chat-example.c            # JSON chat messages example
+│   ├── dynamic-loading-example.c      # Dynamic model loading example
 │   └── Makefile                       # Example build system
 ├── scripts/
 │   ├── build-standalone.sh            # Standalone build script
@@ -78,6 +83,8 @@ cp tools/gstreamer/tests/meson.build gstreamer-llama/tests/
 # Copy examples
 cp tools/gstreamer/examples/signal-example.c gstreamer-llama/examples/
 cp tools/gstreamer/examples/control-pad-example.c gstreamer-llama/examples/
+cp tools/gstreamer/examples/json-chat-example.c gstreamer-llama/examples/
+cp tools/gstreamer/examples/dynamic-loading-example.c gstreamer-llama/examples/
 cp tools/gstreamer/examples/Makefile gstreamer-llama/examples/
 
 # Copy scripts
@@ -485,12 +492,20 @@ A GStreamer plugin for text generation using llama.cpp language models.
 
 ## Features
 
-- Native GStreamer integration for LLM text generation
-- Real-time token streaming
-- Signal-based event system
-- Runtime parameter adjustment via control pad
-- Comprehensive error handling
-- Production-ready robustness
+- **Text input/output pads** - Accepts text prompts, outputs generated text
+- **JSON chat messages** - OpenAI-compatible chat format with automatic template formatting
+- **Dynamic model loading** - Load/unload models at runtime via control pad
+- **Asynchronous operations** - Non-blocking model loading with progress signals
+- **Buffer queuing** - Optional buffering during model transitions
+- **Streaming support** - Real-time token streaming
+- **Configurable properties** - Full control over generation parameters
+- **Per-request parameters** - Override settings via JSON for each request
+- **State management** - Robust model state tracking (UNLOADED/LOADING/READY/ERROR)
+- **Thread-safe** - Proper locking for concurrent access
+- **GObject signals** - Real-time events for tokens, generation, and model lifecycle
+- **Control pad** - Runtime parameter adjustment and model management via JSON
+- **Error handling** - Comprehensive error detection, timeout protection, and graceful recovery
+- **Production-ready** - Input validation, detailed error messages, robust state management
 
 ## Installation
 
@@ -581,6 +596,8 @@ testlog.txt
 # Examples built files
 examples/signal-example
 examples/control-pad-example
+examples/json-chat-example
+examples/dynamic-loading-example
 
 # System
 .DS_Store
