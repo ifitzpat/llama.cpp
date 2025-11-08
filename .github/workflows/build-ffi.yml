@@ -11,6 +11,7 @@ on:
       - 'ggml/**'
       - 'common/**'
       - 'include/**'
+      - '.clang-format'
       - '.github/workflows/build-ffi.yml'
   pull_request:
     paths:
@@ -19,6 +20,7 @@ on:
       - 'ggml/**'
       - 'common/**'
       - 'include/**'
+      - '.clang-format'
       - '.github/workflows/build-ffi.yml'
   workflow_dispatch:
 
